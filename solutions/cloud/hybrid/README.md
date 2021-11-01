@@ -10,6 +10,10 @@ This guide is part of the [Nutanix Solutions Library](https://portal.nutanix.com
 
 # Helpers
 
+## Calm
+
+Relink Calm Apps in DR site using Calm DR tracking script, see that README for details.
+
 ## Flow
 
 Synchronize Nutanix Flow Policies and categories between 2 Prism Central Instances, using Invoke-FlowRuleSync.ps1. See [KB 12253](https://portal.nutanix.com/kb/12253) for details.
