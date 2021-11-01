@@ -8,7 +8,9 @@ In our designs, we detail all the key decisions necessary to deploy a robust, re
 
 ## Nutanix Private Cloud
 
-A private cloud solution with two datacenters for high availability (HA) and disaster recovery (DR). We based this Nutanix Validated Design (NVD) on our Hybrid Cloud Reference Architecture and can deliver it as a bundled solution for general server virtualization that includes hardware, software, and services to accelerate and simplify the deployment and implementation process. The scalable modular design, based on our block-and-pod architecture, is well suited to hybrid cloud use cases of all sizes. You can have our validated solution up and running with minimal burden on your internal teams, allowing you to realize the full value of your infrastructure quickly.
+A private cloud solution with two datacenters for high availability (HA) and disaster recovery (DR). We based this Nutanix Validated Design (NVD) on our Hybrid Cloud Reference Architecture and can deliver it as a bundled solution for general server virtualization that includes hardware, software, and services to accelerate and simplify the deployment and implementation process.
+
+The scalable modular design, based on our block-and-pod architecture, is well suited to hybrid cloud use cases of all sizes. You can have our validated solution up and running with minimal burden on your internal teams, allowing you to realize the full value of your infrastructure quickly.
 
 # Repository Purpose
 
@@ -16,4 +18,4 @@ This repository holds any and all of the open source code required to help form 
 
 # Additional Documentation
 
-The Nutanix Validated Designs themselves are all available in the Solutions Documentation section on the Nutanix user Portal, here: https://portal.nutanix.com/page/documents/solutions/list
+The Nutanix Validated Designs themselves are all available in the [Nutanix Solutions Library](https://portal.nutanix.com/page/documents/solutions/list).

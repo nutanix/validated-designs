@@ -37,7 +37,7 @@
 # 2. Making Changes
 ## 2.1. General Contribution Guidance
 
-Always create a new branch from ValidatedDesigns\master.
+Always create a new branch from validated-designs\master.
   - This repository uses [GitHub branch protection](https://help.github.com/en/github/administering-a-repository/about-protected-branches)
   - The purpose of creating a new branch is to develop pipeline/build changes or add new solutions, the goal of doing a GitHub pull request back into master branch.
 
