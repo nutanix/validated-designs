@@ -1,0 +1,17 @@
+#
+# Copyright (c) 2021 Nutanix Inc. All rights reserved.
+#
+# Author: jon@nutanix.com
+#
+
+# Order is important; the last matching pattern takes the most precedence.
+# When someone opens a pull request that only modifies services files,
+# only the service owner(s) and not the global owner(s) will be requested for a
+# review.
+
+# Repo level reviewers
+# This will catch anything that is outside of the solution specific dirs below.
+*       @JonKohler
+
+# TODO: Add solution specific reviewers
+#/solutions/ @nutanix/nvd-contrib
