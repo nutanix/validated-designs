@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Solutions Documentation
+    url: https://portal.nutanix.com/page/documents/solutions/list
+    about: All Nutanix Solutions documentation, including the Validated Designs, lives on the Nutanix user Portal
