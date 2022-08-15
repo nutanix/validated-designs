@@ -24,6 +24,8 @@ if (
 ):
     raise Exception("Please export 'DEST_PC_IP', 'DEST_PC_USER', 'DEST_PC_PASS' and 'SOURCE_PROJECT_NAME'.")
 
+dest_categorie_map = {}
+
 DEST_PC_IP = os.environ['DEST_PC_IP']
 PC_PORT = 9440
 LENGTH = 100
@@ -77,6 +79,21 @@ def create_category_key(base_url, auth, key):
         log.info('Response: {}'.format(json.dumps(json.loads(resp.content), indent=4)))
         raise Exception("Failed to create category key '{}'.".format(key))
 
+def is_category_key_present(base_url, auth, key):
+    method = 'GET'
+    url = base_url + "/categories/{}".format(key)
+    resp = requests.request(
+        method,
+        url,
+        headers=headers,
+        auth=(auth["username"], auth["password"]),
+        verify=False
+    )
+    if resp.ok:
+        return True
+    else:
+        False
+
 def create_category_value(base_url, auth, key, value):
     method = 'PUT'
     url = base_url + "/categories/{}/{}".format(key, value)
@@ -116,7 +133,7 @@ def get_application_uuids(project_name):
     applications = db_handle.fetch_many(AbacEntityCapability,kind="app",project_reference=project_uuid,select=['kind_id', '_created_timestamp_usecs_'])
     for application in applications:
         application_uuid_list.append(application[1][0])
-    
+
     return application_uuid_list
 
 def create_categories():
@@ -134,16 +151,23 @@ def create_categories():
                         if element.spec.categories != "":
                             category = json.loads(element.spec.categories)
                             for key in category.keys():
-                                if key not in SYS_DEFINED_CATEGORY_KEY_LIST:
-                                    create_category_key(dest_base_url, dest_pc_auth, key)
-                                log.info("Creating key: {} - value: {}".format(key, category[key]))
-                                create_category_value(dest_base_url, dest_pc_auth, key, category[key])
+                                value = category[key]
+                                if (key not in dest_categorie_map.keys()):
+                                    dest_categorie_map[key] = []
+                                    if key not in SYS_DEFINED_CATEGORY_KEY_LIST:
+                                        log.info("Category with key {} not present on pc, creating one".format(key))
+                                        create_category_key(dest_base_url, dest_pc_auth, key)
+                                else:
+                                    if value not in dest_categorie_map[key]:
+                                        dest_categorie_map[key].append(value)
+                                        log.info("Creating key: {} - value: {}".format(key, value))
+                                        create_category_value(dest_base_url, dest_pc_auth, key, value)
 
     log.info("Done with creating categories and values")
 
 def main():
     try:
-        create_categories()        
+        create_categories()
     except Exception as e:
         log.info("Exception: %s" % e)
         raise
