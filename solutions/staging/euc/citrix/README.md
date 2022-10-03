@@ -50,6 +50,12 @@ Before you start, make sure to:
     cd validated-designs/solutions/staging/euc/citrix/configs
     ```
 
+1. Change the git branch to `dev-daas`
+
+    ```
+    git checkout dev-daas
+    ```
+
 1. Create a copy of the `secret.pkrvars.hcl.example` file and make sure the file is not part of your source code control
 
     ```
@@ -144,7 +150,7 @@ Before you start, make sure to:
     win2022_os_iso_uuid = "<UUID_OUTPUT_FROM_TERRAFORM_ADD_BUILD_ISOS>"
 
     // AHV disk image built by Packer and to use for Citrix Cloud Connector machines with Terraform
-    packer_win2022_disk_image_name = ""
+    packer_win2022_disk_image_name = "<DISK_IMAGE_NAME_FROM_PACKER_BUILD>"
     ```
 
 1. Move to the `add-build-isos` Terraform directory to add the ISO images into the AHV Image Service using Terraform
