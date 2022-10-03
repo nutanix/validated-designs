@@ -14,7 +14,7 @@ resource "nutanix_image" "virtio_iso" {
   image_type  = "ISO_IMAGE"
 }
 
-output "virtio_iso_uuid" {
+output "nutanix_virtio_iso_uuid" {
   value = nutanix_image.virtio_iso.id
 }
 
@@ -25,7 +25,7 @@ resource "nutanix_image" "server_os_iso" {
   image_type  = "ISO_IMAGE"
 }
 
-output "server_os_iso_uuid" {
+output "win2022_os_iso_uuid" {
   value = nutanix_image.server_os_iso.id
 }
 
@@ -36,7 +36,7 @@ resource "nutanix_image" "desktop_os_iso" {
   image_type  = "ISO_IMAGE"
 }
 
-output "desktop_os_iso_uuid" {
+output "win10_os_iso_uuid" {
   value = nutanix_image.desktop_os_iso.id
 }
 

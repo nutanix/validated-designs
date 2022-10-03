@@ -6,6 +6,7 @@ provider "registry.terraform.io/nutanix/nutanix" {
   constraints = "1.7.1"
   hashes = [
     "h1:OZzf94y1sqVtO2ye15kInBaK1XNeFdjHwGbhEOWiMzo=",
+    "h1:RuhPa0OIUVV2mZZfg9FDmLW2CoZz8qa0FPKMkmuDsac=",
     "h1:lCiobW5ZGKJZmbXWQsRVUm5Xwn6+fdESxbLtiIhhk28=",
     "h1:simAWX1q/nJLcfQqW9wJdcdMUK3GTttip5B8UuqyVQM=",
     "zh:07923dc03ce0e5d618307c97c86a77280cd406a4cc98cacd4c9e0c4f0f986158",

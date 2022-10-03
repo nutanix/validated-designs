@@ -1,5 +1,5 @@
 - name: Install .Net 3.5
-  ansible.windows.win_optional_feature:
+  ansible.windows.win_feature:
     name: NET-Framework-Core
     state: present
   register: win_feature

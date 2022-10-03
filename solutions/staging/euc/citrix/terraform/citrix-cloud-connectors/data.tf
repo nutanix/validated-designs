@@ -7,7 +7,7 @@ data "nutanix_cluster" "cluster" {
 }
 
 data "nutanix_image" "image" {
-  image_name = var.packer_windows_server_disk_image
+  image_name = var.packer_win2022_disk_image_name
 }
 
 data "template_file" "citrix_cloud_connector_sysprep" {

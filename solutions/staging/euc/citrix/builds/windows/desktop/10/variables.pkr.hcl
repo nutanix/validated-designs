@@ -1,9 +1,9 @@
 // Nutanix Validated Design Prefix
 
 variable "ref_prefix" {
-  type    = string
+  type        = string
   description = "Prefix to include at the start of a resource name"
-  default = "Nutanix_NVD_DaaS_"
+  default     = "Nutanix_NVD_DaaS_"
 }
 
 // Prism Central credentials
@@ -45,122 +45,125 @@ variable "nutanix_wait" {
 // Prism settings
 
 variable "nutanix_cluster" {
-  type = string
+  type        = string
   description = "This is the Prism Element cluster name. Required for building the image"
 }
 
 variable "nutanix_subnet" {
-  type = string
+  type        = string
   description = "This is the Prism Element subnet name. Required for building the image"
 }
 
 // Virtual machine settings
 
 variable "nutanix_vm_cpu" {
-  type    = number
+  type        = number
   description = "Number of virtual CPUs. Required for building the image"
-  default = 4
+  default     = 4
 }
 
 variable "nutanix_vm_memory_mb" {
-  type    = number
+  type        = number
   description = "Virtual machine memory. Required for building the image"
-  default = 8192
+  default     = 8192
 }
 
 variable "nutanix_vm_boot_type" {
-  type    = string
+  type        = string
   description = "Virtual machine boot type. Required for building the image"
-  default = "legacy" # Options: legacy / uefi
+  default     = "legacy" # Options: legacy / uefi
 }
 
 variable "nutanix_vm_disk_size_gb" {
-  type    = number
+  type        = number
   description = "Virtual machine disk size (GB). Required for building the image"
-  default = 60
+  default     = 60
 }
 
-variable "win10_os_iso_name" {
-  type    = string
-  description = "Operating system ISO name in AHV Image Service. Required for building the image"
+variable "win10_os_iso_uuid" {
+  type        = string
+  description = "Operating system ISO UUID in AHV Image Service. Required for building the image"
 }
 
-variable "nutanix_virtio_iso_name" {
-  type    = string
-  description = "Nutanix VirtIO ISO name in AHV Image Service. Required for building the image"
+variable "nutanix_virtio_iso_uuid" {
+  type        = string
+  description = "Nutanix VirtIO ISO UUID in AHV Image Service. Required for building the image"
 }
 
 // OS installer settings for Autounattend.xml
 
 variable "os_installer_language" {
-  type    = string
+  type        = string
   description = "Operating system installer language. Required by Sysprep for building the image"
-  default = "en-US"
+  default     = "en-US"
 }
 
 variable "os_installer_keyboard" {
-  type    = string
+  type        = string
   description = "Operating system installer keyboard. Required by Sysprep for building the image"
-  default = "en-US"
+  default     = "en-US"
 }
 
 variable "win10_kms_key_pro" {
-  type = string
+  type        = string
   description = "Operating system KMS Windows 10 Pro. Required by Sysprep for building the image"
 }
 
 variable "win10_kms_key_enterprise" {
-  type = string
+  type        = string
   description = "Operating system KMS Windows 10 Enterprise. Required by Sysprep for building the image"
 }
 
 variable "win10_image_pro" {
-  type    = string
+  type        = string
   description = "Selects Windows 10 Pro in the editions menu. Required by Sysprep for building the image"
-  default = "Windows 10 Pro" # DO NOT CHANGE
+  default     = "Windows 10 Pro" # DO NOT CHANGE
 }
 
 // OS user settings for Autounattend.xml
 
 variable "os_user_language" {
-  type    = string
+  type        = string
   description = "Windows user language. Required by Sysprep for building the image"
-  default = "en-US"
+  default     = "en-US"
 }
 
 variable "os_user_keyboard" {
-  type    = string
+  type        = string
   description = "Windows user keyboard. Required by Sysprep for building the image"
-  default = "en-US"
+  default     = "en-US"
 }
 
 variable "os_user_timezone" {
-  type    = string
+  type        = string
   description = "Windows user timezone. Required by Sysprep for building the image"
-  default = "UTC"
+  default     = "UTC"
 }
 
 // Packer connection settings
 
 variable "build_username" {
-  type    = string
+  type        = string
   description = "Packer username. Required by Packer for connecting to the guest OS"
 }
 
 variable "build_password" {
-  type      = string
+  type        = string
   description = "Packer password. Required by Packer for connecting to the guest OS"
-  sensitive = true
+  sensitive   = true
 }
 
-// Citrix
+// Citrix Cloud Connector VM settings
 
-variable "citrix_cloud_connectors" {
-  type = string
-  description = "Citrix Cloud Connector machine IP addresses or FQDN separated by commas, ie: citrix1.domain.local,citrix2.domain.local. Required by Citrix VDA"
+variable "citrix_cloud_connector_vm_name" {
+  type        = list(string)
+  description = <<-EOT
+    This is the list of VM names for the Citrix Cloud Connectors.
+    To scale-out/in the number of Citrix Cloud Connectors add/remove VM names and re-apply
+  EOT
 }
 
 variable "citrix_vda_desktop_installer_url" {
-  type = string
+  type        = string
   description = "This is the URL to download the Citrix VDA agent for Windows desktop"
 }

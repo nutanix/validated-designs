@@ -1,0 +1,50 @@
+// All the values are mandatory
+
+// Nutanix Citrix DaaS Validated Design - Reference prefix for tracking resources
+ref_prefix = "NVD_CITRIX_"
+
+// Nutanix Prism Central and Prism Element cluster connection
+nutanix_endpoint = "pc.domain.local" # Prism Central address (fqdn|IP)
+nutanix_cluster  = "Cluster001" # Prism Element cluster name
+nutanix_subnet   = "Primary" # Prism cluster subnet name
+nutanix_insecure = "false" # Ignore insecure certificates (true|false)
+
+// Microsoft AD 
+ad_domain = "domain.local"
+
+// Citrix Cloud Connectors
+citrix_cloud_connector_vm_name = [
+    "ctx-cc-01",
+    "ctx-cc-02"
+]
+
+// ISO images to add into AHV Image Service using Terraform
+nutanix_virtio_iso = {
+    name = "Nutanix_VirtIO-1.1.7"
+    description = "Nutanix VirtIO for Windows (iso) ( Version: 1.1.7 )"
+    source_uri = "https://download.nutanix.com/virtIO/1.1.7/Nutanix-VirtIO-1.1.7.iso"
+}
+
+nutanix_server_os_iso = {
+    name = "Windows_Server_2022"
+    description = "Microsoft Windows Server 2022"
+    source_uri = "<ISO_URL_HERE>"
+}
+
+nutanix_desktop_os_iso = {
+    name = "Windows_10"
+    description = "Microsoft Windows 10"
+    source_uri = "<ISO_URL_HERE>"
+}
+
+// Packages to install in Windows golden images using Packer and Ansible
+citrix_vda_desktop_installer_url = "http://<HOST>/VDAWorkstationSetup_2203_1100.exe"
+citrix_vda_server_installer_url = "http://<HOST>/VDAServerSetup_2203_1100.exe"
+
+// ISO UUIDs after adding with Terraform and to be used by Packer with Autounattend.xml
+nutanix_virtio_iso_uuid = "<UUID_OUTPUT_FROM_TERRAFORM_ADD_BUILD_ISOS>"
+win10_os_iso_uuid = "<UUID_OUTPUT_FROM_TERRAFORM_ADD_BUILD_ISOS>"
+win2022_os_iso_uuid = "<UUID_OUTPUT_FROM_TERRAFORM_ADD_BUILD_ISOS>"
+
+// AHV disk image built by Packer and to use for Citrix Cloud Connector machines with Terraform
+packer_win2022_disk_image_name = "<DISK_IMAGE_NAME_FROM_PACKER_BUILD>"

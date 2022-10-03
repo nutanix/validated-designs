@@ -15,17 +15,16 @@ packer {
 }
 
 locals {
-  os_version        = "Windows 10"
-  os_family         = "windows"
-  os_iso_name       = "${var.ref_prefix}${var.win10_os_iso_name}"
-  virtio_iso_name   = "${var.ref_prefix}${var.nutanix_virtio_iso_name}"
-  build_by          = "Built by: HashiCorp Packer ${packer.version}"
-  build_date        = formatdate("YYYY-MM-DD hh:mm ZZZ", timestamp())
-  build_version     = formatdate("YYYY.MM", timestamp())
-  build_description = "Version: v${local.build_version}\nBuilt on: ${local.build_date}\n${local.build_by}"
-  manifest_date     = formatdate("YYYY-MM-DD hh:mm:ss", timestamp())
-  manifest_path     = "${path.cwd}/manifests/"
-  manifest_output   = "${local.manifest_path}${local.manifest_date}.json"
+  os_version              = "Windows 10"
+  os_family               = "windows"
+  os_iso_uuid             = "${var.win10_os_iso_uuid}"
+  virtio_iso_uuid         = "${var.nutanix_virtio_iso_uuid}"
+  build_by                = "Built by: HashiCorp Packer ${packer.version}"
+  build_date              = formatdate("YYYY-MM-DD hh:mm ZZZ", timestamp())
+  build_name              = "${var.ref_prefix}Win10ENT-{{isotime `2006.01.02_03-04-05`}}"
+  manifest_date           = formatdate("YYYY-MM-DD hh:mm:ss", timestamp())
+  manifest_path           = "${path.cwd}/manifests/"
+  manifest_output         = "${local.manifest_path}${local.manifest_date}.json"
   citrix_cloud_connectors = join(",", var.citrix_cloud_connector_vm_name)
 }
 
@@ -52,11 +51,11 @@ source "nutanix" "windows-desktop-enterprise" {
   }
   vm_disks {
     image_type        = "ISO_IMAGE"
-    source_image_name = local.os_iso_name
+    source_image_uuid = local.os_iso_uuid
   }
   vm_disks {
     image_type        = "ISO_IMAGE"
-    source_image_name = local.virtio_iso_name
+    source_image_uuid = local.virtio_iso_uuid
   }
   vm_nics {
     subnet_name = var.nutanix_subnet
@@ -91,7 +90,7 @@ source "nutanix" "windows-desktop-enterprise" {
   winrm_username = var.build_username
 
   // AHV Disk Image Creation
-  image_name       = "${var.ref_prefix}Win10ENT-{{ isotime `2006.01.02`}}-{{ build `PackerRunUUID`}}"
+  image_name       = "${local.build_name}"
   shutdown_command = "%SystemRoot%\\System32\\Sysprep\\sysprep.exe /quiet /generalize /oobe /shutdown /mode:vm"
   shutdown_timeout = "5m"
 }
@@ -139,14 +138,15 @@ build {
     strip_time = true
 
     custom_data = {
-      build_username   = var.build_username
-      build_date       = local.build_date
-      build_version    = local.build_version
-      vm_cpu           = var.nutanix_vm_cpu
-      vm_disk_size     = var.nutanix_vm_disk_size_gb
-      vm_mem_size      = var.nutanix_vm_memory_mb
-      nutanix_cluster  = var.nutanix_cluster
-      nutanix_endpoint = var.nutanix_endpoint
+      build_by          = local.build_by
+      build_username    = var.build_username
+      build_date        = local.build_date
+      build_name        = local.build_name
+      vm_cpu            = var.nutanix_vm_cpu
+      vm_disk_size      = var.nutanix_vm_disk_size_gb
+      vm_mem_size       = var.nutanix_vm_memory_mb
+      nutanix_cluster   = var.nutanix_cluster
+      nutanix_endpoint  = var.nutanix_endpoint
     }
   }
 }
