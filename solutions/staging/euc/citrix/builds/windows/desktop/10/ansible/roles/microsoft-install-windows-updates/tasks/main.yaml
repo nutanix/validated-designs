@@ -1,0 +1,5 @@
+- name: Install Windows Updates
+  win_updates:
+    category_names: '*'
+    reboot: yes
+    reboot_timeout: 3600

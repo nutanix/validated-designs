@@ -1,0 +1,27 @@
+- name: Install Windows Features
+  win_feature:
+    name:
+      - RDS-RD-Server
+    state: present
+  register: win_feature
+  vars:
+    ansible_become: yes
+    ansible_become_user: system
+    ansible_become_method: runas
+
+- name: Reboot if features require
+  win_reboot:
+  when: win_feature.reboot_required
+
+- name: Install Citrix VDA
+  win_package:
+    path: "{{ citrix_vda_server_installer_url }}"
+    arguments: /quiet /noreboot /enable_remote_assistance /controllers "{{ citrix_cloud_connectors }}" /components VDA /masterimage /virtualmachine /optimize /installdir "c:\program files\citrix" /enable_hdx_ports /enable_hdx_udp_ports /includeadditional "Citrix User Profile Manager","Citrix User Profile Manager WMI Plugin" /exclude "Citrix Supportability Tools","Citrix PDF Printer Driver","Citrix Telemetry Service","Citrix Personalization for App-V - VDA","Citrix Universal Print Client" /disableexperiencemetrics
+    # product_id: '{A4F76A89-757B-4A14-9900-5A15A1325A06}'
+    state: present
+    expected_return_code: [0, 3, 3010]
+  register: citrix_vda_install
+
+- name: Reboot after VDA
+  ansible.windows.win_reboot:
+  when: citrix_vda_install.changed

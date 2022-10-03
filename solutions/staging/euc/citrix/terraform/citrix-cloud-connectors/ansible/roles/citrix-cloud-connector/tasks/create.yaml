@@ -1,0 +1,71 @@
+- name: Create directory structure
+  win_file:
+    path: C:\Windows\Temp\Citrix
+    state: directory
+
+- name: Check if Cloud Connector is downloaded yet
+  win_stat:
+    path: C:\Windows\Temp\Citrix\cwcconnector.exe
+  register: download_file
+
+- name: Download Citrix Cloud Connector
+  win_get_url:
+    url: "https://downloads.cloud.com/{{ citrix_cloud_customer_id }}/connector/cwcconnector.exe"
+    dest: C:\Windows\Temp\Citrix\cwcconnector.exe
+  when: download_file.stat.exists == False
+
+- name: Install Citrix Cloud Connector
+  win_package:
+    path: C:\Windows\Temp\Citrix\cwcconnector.exe
+    arguments: /q /CustomerName:"{{ citrix_cloud_customer_id }}" /ClientId:"{{ citrix_cloud_client_id }}" /ClientSecret:"{{ citrix_cloud_client_secret }}" /ResourceLocationId:"{{ citrix_cloud_resource_location_id }}" /AcceptTermsOfService:true
+    expected_return_code: [0]
+    state: present
+  vars:
+    ansible_become: yes
+    ansible_become_user: system
+    ansible_become_method: runas
+
+- name: Ensure Citrix RemoteHCLServer is in a running state
+  win_service:
+    name: RemoteHCLServer
+  register: result
+  until: result.state is defined and result.state == "running"
+  retries: 30
+  delay: 10
+
+- name: Create directory structure
+  win_file:
+    path: C:\Windows\Temp\Nutanix
+    state: directory
+
+- name: Check if Nutanix AHV plugin for Citrix is downloaded yet
+  win_stat:
+    path: C:\Windows\Temp\Nutanix\NutanixAHV_Citrix_plugin.msi
+  register: download_file
+
+- name: Download Nutanix AHV Plugin for Citrix # https://portal.nutanix.com/page/downloads?product=ahv&bit=Citrix
+  win_get_url:
+    url: "{{ nutanix_citrix_plugin_url }}"
+    dest: C:\Windows\Temp\Nutanix\NutanixAHV_Citrix_plugin.msi
+  when: download_file.stat.exists == False
+
+- name: Install Nutanix AHV Plugin for Citrix
+  win_package:
+    path: C:\Windows\Temp\Nutanix\NutanixAHV_Citrix_Plugin.msi
+    arguments: ALLUSERS=1 ISCITRIXCLOUDINSTALL="C:\Program Files\Common Files\Citrix\HCLPlugins\CitrixMachineCreation\v1.0.0.0" PLUGININSTALLPATH="C:\Program Files\Common Files\Citrix\HCLPlugins\CitrixMachineCreation\v1.0.0.0" INSTALLFOLDER="C:\Program Files\Common Files\Citrix\HCLPlugins\CitrixMachineCreation\v1.0.0.0\NutanixAcropolis" PVSINSTALLFOLDER="C:\Program Files\Common Files\Citrix\HCLPlugins\CitrixMachineCreation\v1.0.0.0\NutanixAHV" REGISTERPLUGINSTOREPATH="C:\Program Files\Common Files\Citrix\HCLPlugins\CitrixMachineCreation\v1.0.0.0" ADDLOCAL=F7_9_CWA_INSTALLFOLDER REMOVE=PVS_F7_14_INSTALLFOLDER,F7_9_INSTALLFOLDER
+    log_path: C:\Windows\Temp\Nutanix\NutanixAHVPlugin-{{lookup('pipe', 'date +%Y%m%dT%H%M%S')}}.log
+    expected_return_code: [0]
+    state: present
+
+- name: Install all updates and reboot as many times as needed
+  win_updates:
+    category_names: '*'
+    reboot: yes
+
+- name: Eject CDROM with unattend.xml
+  ansible.windows.win_powershell:
+    script: |
+      $Eject = New-Object -ComObject "Shell.Application"
+      $Eject.Namespace(17).Items() |
+        Where-Object { $_.Type -eq "CD Drive" } |
+            foreach { $_.InvokeVerb("Eject") }

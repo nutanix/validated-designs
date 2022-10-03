@@ -1,0 +1,50 @@
+- name: Citrix Cloud - Authentication
+  uri:
+    url: https://{{ citrix_cloud_api_location }}/cctrustoauth2/{{ citrix_cloud_customer_id }}/tokens/clients
+    method: POST
+    headers:
+      Content-Type: application/x-www-form-urlencoded
+    body: "grant_type=client_credentials&client_id={{ citrix_cloud_client_id }}&client_secret={{ citrix_cloud_client_secret }}"
+    return_content: yes
+  register: citrix_token
+  vars:
+    ansible_connection: local
+
+- name: Citrix Cloud - GET Edge Cloud Connectors from Resource Locations
+  uri:
+    url: https://agenthub.citrixworkspacesapi.net/{{ citrix_cloud_customer_id }}/edgeservers?location={{ citrix_cloud_resource_location_id }}&connectorType=All&extendedData=true
+    method: GET
+    headers:
+      Content-Type: application/json
+      Authorization: CWSAuth bearer={{citrix_token.json.access_token}}
+    return_content: yes
+  register: citrix_edgeservers
+  vars:
+    ansible_connection: local
+
+- name: Gather facts from collector
+  setup:
+    gather_subnet:
+    - '!all'
+    - facter
+  when: citrix_edgeservers.json
+
+- name: Citrix Cloud - DELETE Edge Cloud Connector
+  uri:
+    url: https://agenthub.citrixworkspacesapi.net/{{ citrix_cloud_customer_id }}/edgeservers/{{ item.id }}
+    method: DELETE
+    headers:
+      Content-Type: application/json
+      Authorization: CWSAuth bearer={{citrix_token.json.access_token}}
+  with_items:
+  - "{{ citrix_edgeservers.json }}"
+  when: item.fqdn == ansible_fqdn
+  vars:
+    ansible_connection: local
+
+- name: Active Directory - UNJOIN Domain
+  win_domain_membership:
+    workgroup_name: WORKGROUP
+    domain_admin_user: "{{ ad_username }}"
+    domain_admin_password: "{{ ad_password }}"
+    state: workgroup

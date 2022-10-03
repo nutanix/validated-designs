@@ -1,0 +1,13 @@
+- name: Install .Net 3.5
+  ansible.windows.win_optional_feature:
+    name: NetFx3
+    state: present
+  register: win_feature
+  vars:
+    ansible_become: yes
+    ansible_become_user: system
+    ansible_become_method: runas
+
+- name: Reboot if required
+  ansible.windows.win_reboot:
+  when: win_feature.reboot_required

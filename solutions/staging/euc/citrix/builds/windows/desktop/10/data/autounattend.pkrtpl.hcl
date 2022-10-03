@@ -209,18 +209,13 @@
             <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
             <NetworkLocation>Work</NetworkLocation>
             <ProtectYourPC>2</ProtectYourPC>
-            <!-- <VMModeOptimizations>
-               <SkipAdministratorProfileRemoval>false</SkipAdministratorProfileRemoval>
-               <SkipNotifyUILanguageChange>true</SkipNotifyUILanguageChange>
-               <SkipWinREInitialization>true</SkipWinREInitialization>
-            </VMModeOptimizations> -->
          </OOBE>
          <UserAccounts>
             <AdministratorPassword>
                <Value>${build_password}</Value>
                <PlainText>true</PlainText>
             </AdministratorPassword>
-            <!-- <LocalAccounts>
+            <LocalAccounts>
                <LocalAccount wcm:action="add">
                   <Password>
                      <Value>${build_password}</Value>
@@ -231,7 +226,7 @@
                   <Name>${build_username}</Name>
                   <Description>Build Account</Description>
                </LocalAccount>
-            </LocalAccounts> -->
+            </LocalAccounts>
          </UserAccounts>
          <FirstLogonCommands>
             <SynchronousCommand wcm:action="add">

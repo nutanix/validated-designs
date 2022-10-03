@@ -11,7 +11,6 @@ variable "ref_prefix" {
 variable "nutanix_username" {
   type        = string
   description = "This is the username for the Prism Central instance. Required for provider"
-  default     = "admin"
 }
 
 variable "nutanix_password" {
@@ -81,16 +80,14 @@ variable "nutanix_vm_disk_size_gb" {
   default = 60
 }
 
-variable "nutanix_os_iso_name" {
+variable "win2022_os_iso_name" {
   type    = string
   description = "Operating system ISO name in AHV Image Service. Required for building the image"
-  default = "Nutanix_NVD_DaaS_Windows_Server_2022"
 }
 
 variable "nutanix_virtio_iso_name" {
   type    = string
   description = "Nutanix VirtIO ISO name in AHV Image Service. Required for building the image"
-  default = "Nutanix_NVD_DaaS_Nutanix_VirtIO-1.1.7"
 }
 
 // OS installer settings for Autounattend.xml
@@ -107,35 +104,29 @@ variable "os_installer_keyboard" {
   default = "en-US"
 }
 
-variable "os_installer_kms_key_datacenter" {
+variable "win2022_kms_key_datacenter" {
   type = string
   description = "Operating system KMS Windows Server 2022 Datacenter. Required by Sysprep for building the image"
 }
 
-variable "os_installer_kms_key_standard" {
+variable "win2022_kms_key_standard" {
   type = string
   description = "Operating system KMS Windows Server 2022 Standard. Required by Sysprep for building the image"
 }
 
-variable "os_installer_image_datacenter_gui" {
-  type    = string
-  description = "Selects Windows Server 2022 Datacenter (Desktop Experience) in the editions menu. Required by Sysprep for building the image"
-  default = "Windows Server 2022 SERVERDATACENTER" # DO NOT CHANGE
-}
-
-variable "os_installer_image_datacenter_core" {
+variable "win2022_image_datacenter_core" {
   type    = string
   description = "Selects Windows Server 2022 Datacenter (Core) in the editions menu. Required by Sysprep for building the image"
   default = "Windows Server 2022 SERVERDATACENTERCORE" # DO NOT CHANGE
 }
 
-variable "os_installer_image_standard_gui" {
+variable "win2022_image_standard_gui" {
   type    = string
   description = "Selects Windows Server 2022 Standard (Desktop Experience) in the editions menu. Required by Sysprep for building the image"
   default = "Windows Server 2022 SERVERSTANDARD" # DO NOT CHANGE
 }
 
-variable "os_installer_image_standard_core" {
+variable "win2022_image_standard_core" {
   type    = string
   description = "Selects Windows Server 2022 Standard (Core) in the editions menu. Required by Sysprep for building the image"
   default = "Windows Server 2022 SERVERSTANDARDCORE" # DO NOT CHANGE
@@ -161,16 +152,34 @@ variable "os_user_timezone" {
   default = "UTC"
 }
 
+variable "os_organization" {
+  type    = string
+  description = "Windows user timezone. Required by Sysprep for building the image"
+  default = "Organization"
+}
+
+variable "os_owner" {
+  type    = string
+  description = "Windows user timezone. Required by Sysprep for building the image"
+  default = "Owner"
+}
+
 // Packer connection settings
 
 variable "build_username" {
   type    = string
   description = "Packer username. Required by Packer for connecting to the guest OS"
-  default = "Administrator"
 }
 
 variable "build_password" {
   type      = string
   description = "Packer password. Required by Packer for connecting to the guest OS"
   sensitive = true
+}
+
+// Citrix
+
+variable "citrix_vda_server_installer_url" {
+  type = string
+  description = "This is the URL to download the Citrix VDA agent for Windows server"
 }

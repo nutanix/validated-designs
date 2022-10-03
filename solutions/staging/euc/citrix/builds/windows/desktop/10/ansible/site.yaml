@@ -1,0 +1,11 @@
+---
+- hosts: all
+  gather_facts: no
+  vars:
+    ansible_connection: winrm
+    ansible_winrm_transport: ntlm 
+    ansible_winrm_server_cert_validation: ignore
+  roles:
+  - microsoft-install-net-35-client
+  - citrix-install-vda-client
+  - microsoft-install-windows-updates # Always run last

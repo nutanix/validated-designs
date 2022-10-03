@@ -1,0 +1,12 @@
+---
+- hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: "{{ ad_username }}@{{ ad_domain }}"
+    ansible_password: "{{ ad_password }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: ntlm 
+    ansible_winrm_server_cert_validation: ignore
+
+  roles:
+  - citrix-cloud-connector
