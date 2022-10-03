@@ -91,14 +91,14 @@ variable "citrix_cloud_connector_vm_config" {
   })
   default = {
     num_sockets          = 2
-    memory_size_mib      = 8 * 1024
-    disk_size_mib        = 60 * 1024
+    memory_size_mib      = 8    # Value on GB
+    disk_size_mib        = 60   # Value on GB
     num_vcpus_per_socket = 1
   }
   description = "This is the virtual machine hardware settings. Required by Terraform" // https://docs.citrix.com/en-us/citrix-cloud/citrix-cloud-resource-locations/citrix-cloud-connector/technical-details.html#system-requirements
 }
 
-variable "packer_windows_server_disk_image" {
+variable "packer_win2022_disk_image_name" {
   type        = string
   description = "This is the disk image name built by Packer. Required by Terraform"
 }

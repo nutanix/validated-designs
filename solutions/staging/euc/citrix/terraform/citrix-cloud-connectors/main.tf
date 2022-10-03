@@ -13,7 +13,7 @@ resource "nutanix_virtual_machine" "citrix_cloud_connector" {
   cluster_uuid         = data.nutanix_subnet.vlan.cluster_uuid
   num_vcpus_per_socket = var.citrix_cloud_connector_vm_config.num_vcpus_per_socket
   num_sockets          = var.citrix_cloud_connector_vm_config.num_sockets
-  memory_size_mib      = var.citrix_cloud_connector_vm_config.memory_size_mib
+  memory_size_mib      = var.citrix_cloud_connector_vm_config.memory_size_mib * 1024
   disk_list {
     data_source_reference = {
       kind = "image"
@@ -26,7 +26,7 @@ resource "nutanix_virtual_machine" "citrix_cloud_connector" {
         adapter_type = "SCSI"
       }
     }
-    disk_size_bytes = var.citrix_cloud_connector_vm_config.disk_size_mib * 1024 * 1024
+    disk_size_bytes = var.citrix_cloud_connector_vm_config.disk_size_mib * 1024 * 1024 * 1024
   }
 
   guest_customization_sysprep = {
