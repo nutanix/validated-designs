@@ -2,7 +2,11 @@
 
 The Self-Service blueprints are ready to upload into Nutanix Self-Service and use in production to deploy and customize Windows and Linux virtual machines.
 
-# Linux Blueprint
+## Nutanix Validated Design for Mid-Market Self-Service blueprints
+
+You can find more information about Nutanix Validated Design for Mid-Market size customers on [Nutanix Support Portal](https://portal.nutanix.com/page/documents/nutanix-validated-design/list)
+
+### Linux Blueprint
 
 Linux blueprint features following integrations:
 - Add DNS entry in Windows DNS services
@@ -11,7 +15,7 @@ Linux blueprint features following integrations:
 - Install Fio
 - chedule crontab job for fio
 
-# Windows Blueprint
+### Windows Blueprint
 
 Windows blueprint features following integrations:
 - Add DNS entry in Windows DNS services
