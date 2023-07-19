@@ -10,6 +10,7 @@ import copy
 from calm.common.flags import gflags
 
 from calm.lib.model.store.db_session import flush_session
+from aplos.insights.entity_capability import EntityCapability
 import calm.lib.model as model
 
 from helper import change_project, init_contexts, log
@@ -24,15 +25,17 @@ LENGTH = 100
 
 if (
     'DEST_PROJECT_NAME' not in os.environ or
+    'SOURCE_PROJECT_NAME' not in os.environ or
     'DEST_PC_USER' not in os.environ or
     'DEST_PC_PASS' not in os.environ
     ):
-    raise Exception("Please export 'DEST_PROJECT_NAME', 'DEST_PC_USER' &  'DEST_PC_PASS'.")
+    raise Exception("Please export 'DEST_PROJECT_NAME', 'SOURCE_PROJECT_NAME', 'DEST_PC_USER' &  'DEST_PC_PASS'.")
 
 dest_base_url = "https://{}:{}/api/nutanix/v3".format(DEST_PC_IP,str(PC_PORT))
 dest_pc_auth = { "username": os.environ['DEST_PC_USER'], "password": os.environ['DEST_PC_PASS']}
 
 DEST_PROJECT = os.environ['DEST_PROJECT_NAME']
+SRC_PROJECT = os.environ['SOURCE_PROJECT_NAME']
 headers = {'content-type': 'application/json', 'Accept': 'application/json'}
 
 def get_vm(base_url, auth, uuid):
@@ -49,18 +52,20 @@ def get_vm(base_url, auth, uuid):
         resp_json = resp.json()
         return resp_json
     else:
-        log.info("Failed to get vms.")
-        log.info('Status code: {}'.format(resp.status_code))
-        log.info('Response: {}'.format(json.dumps(json.loads(resp.content), indent=4)))
-        raise Exception("Failed to get vms.")
+        raise Exception("Failed to get vm '{}'.".format(uuid))
 
 def get_account_uuid_map():
     nutanix_pc_accounts = model.NutanixPCAccount.query(deleted=False)
     dest_account_uuid_map = {}
+    pc_account = None
     for account in nutanix_pc_accounts:
         if account.data.server == DEST_PC_IP:
             pc_account = account
             break
+
+    if not pc_account:
+        raise Exception("Unable to find destination PC account '{}'".format(DEST_PC_IP))
+
     for pe in pc_account.data.nutanix_account:
         dest_account_uuid_map[pe.data.cluster_uuid] = str(pe.uuid)
     return dest_account_uuid_map
@@ -86,7 +91,15 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
         for i in range(len(NSE.spec.resources.nic_list)):
             NSE.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
             NSE.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
-            NSE.spec.resources.nic_list[i].ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            for ip_endpoint in ip_endpoint_list:
+                if "ip_type" in ip_endpoint:
+                    del ip_endpoint["ip_type"]
+                if "gateway_address_list" in ip_endpoint:
+                    del ip_endpoint["gateway_address_list"]
+                if "prefix_length" in ip_endpoint:
+                    del ip_endpoint["prefix_length"]
+            NSE.spec.resources.nic_list[i].ip_endpoint_list = ip_endpoint_list
         for i in range(len(NSE.spec.resources.disk_list)):
             NSE.spec.resources.disk_list[i].device_properties = vm["spec"]["resources"]["disk_list"][i]["device_properties"]
             if "disk_size_mib" in vm["spec"]["resources"]["disk_list"][i]:
@@ -105,7 +118,15 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
         for i in range(len(NS.spec.resources.nic_list)):
             NS.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
             NS.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
-            NS.spec.resources.nic_list[i].ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            for ip_endpoint in ip_endpoint_list:
+                if "ip_type" in ip_endpoint:
+                    del ip_endpoint["ip_type"]
+                if "gateway_address_list" in ip_endpoint:
+                    del ip_endpoint["gateway_address_list"]
+                if "prefix_length" in ip_endpoint:
+                    del ip_endpoint["prefix_length"]
+            NS.spec.resources.nic_list[i].ip_endpoint_list = ip_endpoint_list
         #for i in range(len(NS.spec.resources.disk_list)):
         #    NS.spec.resources.disk_list[i].device_properties = vm["spec"]["resources"]["disk_list"][i]["device_properties"]
         ##    NS.spec.resources.disk_list[i].disk_size_mib = vm["spec"]["resources"]["disk_list"][i]["disk_size_mib"]
@@ -133,7 +154,16 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
         for i in range(len(NSC.spec.resources.nic_list)):
             NSC.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
             NSC.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
-            NSC.spec.resources.nic_list[i].ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
+            for ip_endpoint in ip_endpoint_list:
+                if "ip_type" in ip_endpoint:
+                    del ip_endpoint["ip_type"]
+                if "gateway_address_list" in ip_endpoint:
+                    del ip_endpoint["gateway_address_list"]
+                if "prefix_length" in ip_endpoint:
+                    del ip_endpoint["prefix_length"]
+            NSC.spec.resources.nic_list[i].ip_endpoint_list = ip_endpoint_list
+
         for i in range(len(NSC.spec.resources.disk_list)):
             NSC.spec.resources.disk_list[i].device_properties = vm["spec"]["resources"]["disk_list"][i]["device_properties"]
             if "disk_size_mib" in vm["spec"]["resources"]["disk_list"][i]:
@@ -235,13 +265,17 @@ def update_substrates(vm_uuid_map):
 
 def update_app_project(vm_uuid_map):
     app_names = set()
+    app_kind = "app"
 
     for instance_id in vm_uuid_map.keys():
         NSE = model.NutanixSubstrateElement.query(instance_id=vm_uuid_map[instance_id], deleted=False)
         if NSE:
             NSE = NSE[0]
             app_name = model.AppProfileInstance.get_object(NSE.app_profile_instance_reference).application.name
-            app_names.add(app_name)
+            app_uuid = model.AppProfileInstance.get_object(NSE.app_profile_instance_reference).application.uuid
+            entity_cap = EntityCapability(kind_name=app_kind, kind_id=str(app_uuid))
+            if entity_cap.project_name == SRC_PROJECT:
+                app_names.add(app_name)
 
     for app_name in app_names:
         change_project(app_name, DEST_PROJECT)
