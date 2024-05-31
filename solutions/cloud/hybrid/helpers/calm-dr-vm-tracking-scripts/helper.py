@@ -15,7 +15,7 @@ from calm.common.flags import gflags
 from calm.common.project_util import ProjectUtil
 from calm.lib.model import Application, Account
 from calm.lib.constants import SUBSTRATE
-from calm.lib.model.store.db import create_db_connection
+from calm.lib.model.store.idf.db import create_db_connection
 from calm.lib.model.store.db_session import create_session, set_session_type
 from calm.pkg.common.scramble import init_scramble
 
@@ -151,7 +151,7 @@ def change_project(application_name, new_project_name):
                 vm_uuids.append(str(sub_el.instance_id))
 
     # pc_account_uuid_object_map suppose to have just one entry as we just support one account of type in project
-    pc_account_obj = pc_account_uuid_object_map.values()[0]
+    pc_account_obj = list(pc_account_uuid_object_map.values())[0]
     is_app_remote_pc = not pc_account_obj.data.host_pc
     if is_app_remote_pc:
         pc_ip = pc_account_obj.data.server

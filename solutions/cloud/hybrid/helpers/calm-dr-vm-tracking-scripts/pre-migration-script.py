@@ -10,7 +10,7 @@ import calm.lib.model as model
 
 from helper import init_contexts, log
 
-from calm.lib.model.store.db import get_insights_db
+from calm.lib.model.store.idf.db import get_insights_db
 
 from calm.lib.proto import AbacEntityCapability
 
@@ -52,7 +52,10 @@ SYS_DEFINED_CATEGORY_KEY_LIST = [
     "CalmUser",
     "account_uuid",
     "TemplateType",
-    "VirtualNetworkType"
+    "VirtualNetworkType",
+    "CalmClusterUuid",
+    "CalmProject",
+    "CalmUsername"
 ]
 
 headers = {'content-type': 'application/json', 'Accept': 'application/json'}
