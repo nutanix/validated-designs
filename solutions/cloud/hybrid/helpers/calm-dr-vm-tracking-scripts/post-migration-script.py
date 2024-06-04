@@ -345,12 +345,6 @@ def get_vm_source_dest_uuid_map():
                 step_uuid = step_execution_status_src["step_uuid"]
                 src_vm_uuid = step_execution_status_src["any_entity_reference_list"][0]["uuid"]
                 dest_vm_uuid = step_execution_status_src["recovered_entity_info_list"][0]["recovered_entity_info"].get("entity_uuid")
-                #for step_execution_status_dest in step_execution_status_list:
-                #    if (
-                #        step_execution_status_dest["parent_step_uuid"] == step_uuid and
-                #        step_execution_status_dest["operation_type"] in ["ENTITY_RESTORATION", "ENTITY_MIGRATION"]
-                #    ):
-                #        dest_vm_uuid = step_execution_status_dest["any_entity_reference_list"][0]["uuid"]
                 vm_source_dest_uuid_map[src_vm_uuid] = dest_vm_uuid
 
     return vm_source_dest_uuid_map
@@ -373,3 +367,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
