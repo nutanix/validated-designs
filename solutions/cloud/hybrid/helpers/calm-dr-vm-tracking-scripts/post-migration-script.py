@@ -250,9 +250,7 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
         application.save()
 
 def update_substrates(vm_uuid_map):
-
     dest_account_uuid_map = get_account_uuid_map()
-
     for vm_uuid in vm_uuid_map.keys():
         try:
             vm = get_vm(dest_base_url, dest_pc_auth, vm_uuid_map[vm_uuid])
@@ -346,12 +344,7 @@ def get_vm_source_dest_uuid_map():
             if step_execution_status_src["operation_type"] == "ENTITY_RECOVERY" :
                 step_uuid = step_execution_status_src["step_uuid"]
                 src_vm_uuid = step_execution_status_src["any_entity_reference_list"][0]["uuid"]
-                for step_execution_status_dest in step_execution_status_list:
-                    if (
-                        step_execution_status_dest["parent_step_uuid"] == step_uuid and
-                        step_execution_status_dest["operation_type"] in ["ENTITY_RESTORATION", "ENTITY_MIGRATION"]
-                    ):
-                        dest_vm_uuid = step_execution_status_dest["any_entity_reference_list"][0]["uuid"]
+                dest_vm_uuid = step_execution_status_src["recovered_entity_info_list"][0]["recovered_entity_info"].get("entity_uuid")
                 vm_source_dest_uuid_map[src_vm_uuid] = dest_vm_uuid
 
     return vm_source_dest_uuid_map
