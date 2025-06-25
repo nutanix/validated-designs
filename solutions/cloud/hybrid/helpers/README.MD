@@ -1,3 +1,6 @@
+> [!CAUTION]
+> You need to use different synchronization scripts depending on which version of Flow Network Security you are using. Please read Nutanix [KB12253](https://portal.nutanix.com/page/documents/kbs/details?targetId=kA07V000000LXXdSAO) for more details.
+
 # Invoke-FlowRulesSync.ps1:
 
 The Invoke-FlowRulesSync.ps1 script can be used to synchronize Nutanix Flow Security policies and their related entities (categories, service groups and addresses) from one Prism Central instance to another.
