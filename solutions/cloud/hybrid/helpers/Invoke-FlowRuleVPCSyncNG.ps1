@@ -30,8 +30,8 @@
 .LINK
   http://www.nutanix.com/services
 .NOTES
-  Author: Pramod Singh (pramod.singh@nutanix.com)
-  Revision: Dec 10th 2024
+  Author: Pramod Singh (pramod.singh@nutanix.com) & Stephane Bourdeaud (stephane.bourdeaud@nutanix.com)
+  Revision: Jul 28th 2025
 #>
 
 
@@ -689,7 +689,7 @@ public static void Ignore()
 
         if ($rateState.Counter -ge $maxPerSecond)
         {
-            Write-Host "$(Get-Date) [INFO] [$method] Reached $maxPerSecond req/sec. Sleeping 1 second..." -ForegroundColor Yellow
+            Write-Host "$(Get-Date) [WARNING] [$method] Reached $maxPerSecond req/sec. Sleeping 1 second..." -ForegroundColor Yellow
             Start-Sleep -Seconds 1
             $rateState.Counter = 0
             $rateState.StartTime = Get-Date
@@ -748,7 +748,7 @@ public static void Ignore()
                     $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
 
                     if (-not $resp -or -not $resp.data) {
-                        Write-Host "$(Get-Date) [INFO] No data received." -ForegroundColor Yellow
+                        Write-Host "$(Get-Date) [WARNING] No data received." -ForegroundColor Yellow
                         break
                     }
 
@@ -1865,7 +1865,9 @@ public static void Ignore()
 Maintenance Log
 Date       By              Updates (newest updates at the top)
 ---------- -------------   ----------------------------------------------------
-10/12/2024 pramod.singh   Initial release.
+10/12/2024 pramod.singh   Initial release (based of PoSH script written by 
+                          @nx-sbourdeaud).
+07/28/2025 nx-sbourdeaud  Making script compatible with new "Global" scope.
 
 ################################################################################
 '@
@@ -2100,8 +2102,11 @@ Date       By              Updates (newest updates at the top)
                         {
                             Write-Host "$(Get-Date) [WARNING] Not Syncing policy $($policy.data.name) as it is a VLAN policy" -ForegroundColor Cyan
                             continue
+                        } 
+                        elseif ($policy.data.scope -ne "GLOBAL") 
+                        {
+                            Sync-Vpc -policy $policy
                         }
-                        Sync-Vpc -policy $policy
                         Sync-Categories -policy $policy
                         Sync-ServiceGroups -policy $policy
                         Sync-AddressGroups -policy $policy
@@ -2117,15 +2122,30 @@ Date       By              Updates (newest updates at the top)
                                 $policyname = $rename + "_" + $policy.data.name
                                 Write-Host "$(Get-Date) [INFO] Adding Flow policy $($nsp.name) to $targetPc with new name $policyname" -ForegroundColor Cyan
                             }
-                            $content = @{
-                                name= $policyname;
-                                type= $policy.data.type;
-                                description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                state= $policy.data.state;
-                                rules= $policy.data.rules;
-                                isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                vpcReferences= $policy.data.vpcReferences
+                            if ($policy.data.scope -ne "GLOBAL") {
+                                $content = @{
+                                    name= $policyname;
+                                    type= $policy.data.type;
+                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
+                                    state= $policy.data.state;
+                                    rules= $policy.data.rules;
+                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
+                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
+                                    vpcReferences= $policy.data.vpcReferences
+                                }
+                            } 
+                            else 
+                            {
+                                $content = @{
+                                    name= $policyname;
+                                    type= $policy.data.type;
+                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
+                                    state= $policy.data.state;
+                                    rules= $policy.data.rules;
+                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
+                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
+                                    scope= $policy.data.scope
+                                }
                             }
                             $payload = (ConvertTo-Json $content -Depth 100)
                             $ntnx_req_id = New-Guid
@@ -2208,9 +2228,10 @@ Date       By              Updates (newest updates at the top)
                         {
                             Write-Host "$(Get-Date) [WARNING] Not Syncing policy $($policy.data.name) as it is a VLAN policy" -ForegroundColor Cyan
                             continue
+                        } elseif ($policy.data.scope -ne "GLOBAL") 
+                        {
+                            Sync-Vpc -policy $policy
                         }
-
-                        Sync-Vpc -policy $policy
                         Sync-Categories -policy $policy
                         Sync-ServiceGroups -policy $policy
                         Sync-AddressGroups -policy $policy
@@ -2236,15 +2257,31 @@ Date       By              Updates (newest updates at the top)
                                 $policyname = $rename + "_" + $policy.data.name
                                 Write-Host "$(Get-Date) [INFO] Updating Flow policy $($nsp.name) to $targetPc with new name $policyname" -ForegroundColor Cyan
                             }
-                            $content = @{
-                                name= $policyname;
-                                type= $policy.data.type;
-                                description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                state= $policy.data.state;
-                                rules= $policy.data.rules;
-                                isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                vpcReferences= $policy.data.vpcReferences
+                            if ($policy.data.scope -ne "GLOBAL") 
+                            {
+                                $content = @{
+                                    name= $policyname;
+                                    type= $policy.data.type;
+                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
+                                    state= $policy.data.state;
+                                    rules= $policy.data.rules;
+                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
+                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
+                                    vpcReferences= $policy.data.vpcReferences
+                                }
+                            }
+                            else 
+                            {
+                                $content = @{
+                                    name= $policyname;
+                                    type= $policy.data.type;
+                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
+                                    state= $policy.data.state;
+                                    rules= $policy.data.rules;
+                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
+                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
+                                    scope= $policy.data.scope
+                                }
                             }
                             $payload = (ConvertTo-Json $content -Depth 100)
                             $ntnx_req_id = New-Guid
