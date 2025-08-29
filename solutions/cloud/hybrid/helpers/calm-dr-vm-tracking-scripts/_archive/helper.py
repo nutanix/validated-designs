@@ -1,8 +1,11 @@
 "Script to change application and its underlying vm's ownership"
 
 # -*- coding: utf-8 -*-
-import os
+
+import requests
+import ujson
 import logging
+
 from aplos.categories.category import Category, CategoryKey
 from aplos.insights.entity_capability import EntityCapability
 from aplos.lib.tenant.tenant_utils import TenantUtils
@@ -17,24 +20,9 @@ from calm.lib.model.store.db_session import create_session, set_session_type
 from calm.pkg.common.scramble import init_scramble
 
 log = logging.getLogger('eylog')
-log.setLevel(logging.INFO)
-log.propagate = False
-
-# Remove all handlers associated with the logger object (to avoid duplicate logs)
-if log.hasHandlers():
-    log.handlers.clear()
-
-formatter = logging.Formatter('[%(levelname)s] %(asctime)s.%(msecs)03d - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-handler = logging.StreamHandler()
-handler.setFormatter(formatter)
-log.addHandler(handler)
-
-def guardrail_save(obj, dry_run, description=""):
-    if dry_run:
-        log.info("[DRY RUN] Would save object: %s", description)
-    else:
-        obj.save()
-        log.info("Saved object: %s", description)
+logging.basicConfig(level=logging.INFO,
+                    format="%(message)s",
+                    datefmt='%H:%M:%S')
 
 init_config()
 
@@ -251,8 +239,6 @@ def change_project_vmware(application_name, new_project_name):
     log.info("Successfully moved all vm's of '{}' application to '{}' project".format(app_name, new_project_name))
     log.info("Successfully moved '{}' application to  '{}' project ".format(app_name, new_project_name))
 
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-
 def handle_entity_project_change(entity_kind, entity_uuid, tenant_uuid, new_project_name, new_project_uuid):
     """
     Handles entity project change
@@ -286,9 +272,6 @@ def handle_entity_project_change(entity_kind, entity_uuid, tenant_uuid, new_proj
     entity_cap.change_project_reference(new_project_uuid, new_project_name)
 
     # 5. Save EC
-    if DRY_RUN:
-        log.info("[DRY RUN] Would update entity '%s' (%s) to project '%s' (%s)", entity_kind, entity_uuid, new_project_name, new_project_uuid)
-        return
     entity_cap.save()
 
 
@@ -327,9 +310,6 @@ def update_vm_in_remote_pc(pc_ip, pc_username, pc_password, vm_uuid, new_project
     vm_get_response.pop('status')
     categories = vm_get_response.get('metadata', {}).get('categories', {})
     categories['CalmProject'] = new_project_name
-    if DRY_RUN:
-        log.info("[DRY RUN] Would update VM '%s' on remote PC '%s' to project '%s'", vm_uuid, pc_ip, new_project_name)
-        return
     response = requests.put(vm_api_url, auth=auth, data=ujson.dumps(vm_get_response), headers=headers, verify=False)
     if response.status_code not in [200, 202]:
         log.info("Response status code {}, respnse content {}".format(response.status_code, response.content))
@@ -353,8 +333,5 @@ def get_or_create_category(name, value, tenant_uuid):
         return category_obj
     category_obj.tenant_uuid = tenant_uuid
     category_obj.initialize(name, value, "Created by CALM", None, True)
-    if DRY_RUN:
-        log.info("[DRY RUN] Would create category with name '%s' and value '%s'", name, value)
-        return category_obj  # or None, depending on your logic
     category_obj.save()
     return category_obj
