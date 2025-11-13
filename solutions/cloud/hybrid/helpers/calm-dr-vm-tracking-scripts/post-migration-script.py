@@ -71,10 +71,51 @@ def get_account_uuid_map():
         dest_account_uuid_map[pe.data.cluster_uuid] = str(pe.uuid)
     return dest_account_uuid_map
 
+def get_vpc_reference(base_url, auth, subnet_uuid):
+    """
+    Get VPC reference UUID for a given subnet.
+    Returns None if the subnet is not in a VPC (e.g., regular VLAN-backed subnets).
+    """
+    url = base_url + f"/subnets/{subnet_uuid}"
+    try:
+        resp = requests.request(
+            'GET',
+            url,
+            headers=headers,
+            auth=(auth["username"], auth["password"]),
+            verify=False
+        )
+        if resp.ok:
+            resp_json = resp.json()
+            # Safely check if vpc_reference exists (only present for VPC subnets)
+            vpc_ref = resp_json.get("status", {}).get("resources", {}).get("vpc_reference")
+            if vpc_ref:
+                return vpc_ref.get("uuid")
+            else:
+                log.debug(f"Subnet '{subnet_uuid}' is not in a VPC (no vpc_reference found)")
+                return None
+        else:
+            log.warning("Failed to get subnet '%s' details. Status: %s, Response: %s", 
+                       subnet_uuid, resp.status_code, resp.text)
+            return None
+    except Exception as e:
+        log.warning("Error getting VPC reference for subnet '%s': %s", subnet_uuid, e)
+        return None
+
 def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
     instance_id = vm_uuid
     vm_name = vm["status"]["name"]
     cluster_uuid = vm["status"]["cluster_reference"]["uuid"]
+    
+    # Query and add VPC references to NICs if they exist
+    nics_list = vm["status"]["resources"]["nic_list"]
+    for _nic in nics_list:
+        subnet_uuid = _nic["subnet_reference"]["uuid"]
+        vpc_uuid = get_vpc_reference(dest_base_url, dest_pc_auth, subnet_uuid)
+        if vpc_uuid:
+            _nic["vpc_reference"] = {"kind": "vpc", "uuid": vpc_uuid}
+    vm["status"]["resources"]["nic_list"] = nics_list
+    
     NSE = model.NutanixSubstrateElement.query(instance_id=instance_id, deleted=False)
     app_name = None
     if NSE:
@@ -106,6 +147,9 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
             for i in range(len(NSE.spec.resources.nic_list)):
                 NSE.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
                 NSE.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
+                # Update VPC reference if it exists (for VPC-based subnets)
+                if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                    NSE.spec.resources.nic_list[i].vpc_reference = vm["status"]["resources"]["nic_list"][i]["vpc_reference"]
                 ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
                 for ip_endpoint in ip_endpoint_list:
                     if "ip_type" in ip_endpoint:
@@ -137,6 +181,9 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
             for i in range(len(NS.spec.resources.nic_list)):
                 NS.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
                 NS.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
+                # Update VPC reference if it exists (for VPC-based subnets)
+                if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                    NS.spec.resources.nic_list[i].vpc_reference = vm["status"]["resources"]["nic_list"][i]["vpc_reference"]
                 ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
                 for ip_endpoint in ip_endpoint_list:
                     if "ip_type" in ip_endpoint:
@@ -154,6 +201,9 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
                         if task.type == "PROVISION_NUTANIX":
                             for i, nic in enumerate(task.attrs.resources.nic_list):
                                 nic.subnet_reference.uuid = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]["uuid"]
+                                # Update VPC reference if it exists (for VPC-based subnets)
+                                if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                                    nic.vpc_reference = vm["status"]["resources"]["nic_list"][i]["vpc_reference"]
                         task.save()
             NS.save()
             log.info(prefix + "Saved updated replica_group for VM '%s'.", vm_name)
@@ -167,6 +217,9 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
             for i in range(len(NSC.spec.resources.nic_list)):
                 NSC.spec.resources.nic_list[i].nic_type = vm["status"]["resources"]["nic_list"][i]["nic_type"]
                 NSC.spec.resources.nic_list[i].subnet_reference = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
+                # Update VPC reference if it exists (for VPC-based subnets)
+                if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                    NSC.spec.resources.nic_list[i].vpc_reference = vm["status"]["resources"]["nic_list"][i]["vpc_reference"]
                 ip_endpoint_list = vm["spec"]["resources"]["nic_list"][i]["ip_endpoint_list"]
                 for ip_endpoint in ip_endpoint_list:
                     if "ip_type" in ip_endpoint:
@@ -219,6 +272,9 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
             nic_list = substrate_cfg.get("create_spec").get("resources").get("nic_list")
             for i, nic in enumerate(nic_list):
                 nic["subnet_reference"] = vm["status"]["resources"]["nic_list"][i]["subnet_reference"]
+                # Update VPC reference if it exists (for VPC-based subnets)
+                if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                    nic["vpc_reference"] = vm["status"]["resources"]["nic_list"][i]["vpc_reference"]
             substrate_cfg["create_spec"]["resources"]["account_uuid"] = dest_account_uuid_map[cluster_uuid]
 
         clone_bp.intent_spec = json.dumps(clone_bp_intent_spec_dict)
@@ -226,19 +282,32 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
 
         log.info(prefix + "Updating patch config action for '%s' with instance_id '%s'.", vm_name, instance_id)
         vm_first_nic_subnet_uuid = ""
-        if len(vm["status"]["resources"]["nic_list"]) >= 0:
+        vm_first_nic_vpc_uuid = ""
+        if len(vm["status"]["resources"]["nic_list"]) > 0:
             vm_first_nic_subnet_uuid = vm["status"]["resources"]["nic_list"][0]["subnet_reference"]["uuid"]
+            # Get VPC reference from first NIC if it exists (for VPC-based subnets)
+            if vm["status"]["resources"]["nic_list"][0].get("vpc_reference"):
+                vm_first_nic_vpc_uuid = vm["status"]["resources"]["nic_list"][0]["vpc_reference"].get("uuid", "")
         for patch in application.active_app_profile_instance.patches:
             patch_attr_list = patch.attrs_list[0]
             patch_data = patch_attr_list.data
             for i in range(len(patch_data.pre_defined_nic_list)):
                 if patch_data.pre_defined_nic_list[i].operation == "add":
                     patch_data.pre_defined_nic_list[i].subnet_reference.uuid=vm_first_nic_subnet_uuid
+                    # Update VPC reference if it exists (for VPC-based subnets)
+                    if vm_first_nic_vpc_uuid:
+                        patch_data.pre_defined_nic_list[i].vpc_reference = {"kind": "vpc", "uuid": vm_first_nic_vpc_uuid}
                 else:
                     if len(vm["status"]["resources"]["nic_list"]) >= i + 1:
                         patch_data.pre_defined_nic_list[i].subnet_reference.uuid=vm["status"]["resources"]["nic_list"][i]["subnet_reference"]["uuid"]
+                        # Update VPC reference if it exists (for VPC-based subnets)
+                        if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                            patch_data.pre_defined_nic_list[i].vpc_reference.uuid = vm["status"]["resources"]["nic_list"][i]["vpc_reference"].get("uuid", "")
                     else:
                         patch_data.pre_defined_nic_list[i].subnet_reference.uuid = vm_first_nic_subnet_uuid
+                        # Update VPC reference if it exists (for VPC-based subnets)
+                        if vm_first_nic_vpc_uuid:
+                            patch_data.pre_defined_nic_list[i].vpc_reference.uuid = vm_first_nic_vpc_uuid
             patch.save()
             application.active_app_profile_instance.save()
             application.save()
@@ -250,11 +319,20 @@ def update_substrate_info(vm_uuid, vm, dest_account_uuid_map, vm_uuid_map):
             for i in range(len(patch_data["pre_defined_nic_list"])):
                 if patch_data["pre_defined_nic_list"][i]["operation"] == "add":
                     patch_data["pre_defined_nic_list"][i]["subnet_reference"]["uuid"]=vm_first_nic_subnet_uuid
+                    # Update VPC reference if it exists (for VPC-based subnets)
+                    if vm_first_nic_vpc_uuid:
+                        patch_data["pre_defined_nic_list"][i]["vpc_reference"] = {"kind": "vpc", "uuid": vm_first_nic_vpc_uuid}
                 else:
                     if len(vm["status"]["resources"]["nic_list"]) >= i + 1:
                         patch_data["pre_defined_nic_list"][i]["subnet_reference"]["uuid"]=vm["status"]["resources"]["nic_list"][i]["subnet_reference"]["uuid"]
+                        # Update VPC reference if it exists (for VPC-based subnets)
+                        if vm["status"]["resources"]["nic_list"][i].get("vpc_reference"):
+                            patch_data["pre_defined_nic_list"][i]["vpc_reference"]["uuid"] = vm["status"]["resources"]["nic_list"][i]["vpc_reference"].get("uuid", "")
                     else:
                         patch_data["pre_defined_nic_list"][i]["subnet_reference"]["uuid"] = vm_first_nic_subnet_uuid
+                        # Update VPC reference if it exists (for VPC-based subnets)
+                        if vm_first_nic_vpc_uuid:
+                            patch_data["pre_defined_nic_list"][i]["vpc_reference"]["uuid"] = vm_first_nic_vpc_uuid
         application.active_app_profile_instance.intent_spec = ujson.dumps(app_intent_spec_dict)
         application.active_app_profile_instance.save()
         application.save()
@@ -459,7 +537,7 @@ def main():
             return
         init_contexts()
         processed, updated, failed = update_substrates(vm_uuid_map)
-        # update_substrates(vm_uuid_map)
+        update_substrates(vm_uuid_map)
         # update_app_project(vm_uuid_map)  # Uncomment if you want to update app projects too
     except Exception as e:
         log.error("Exception: %s", e)
