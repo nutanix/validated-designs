@@ -1,99 +1,84 @@
-# Script to track DR Failover of UVM from PC -> PC and relink NCM Self-Service Apps
+# Relink NCM Self-Service Applications After Disaster Recovery
 
-This solution helps customers relink NCM Self-Service Apps to UVMs in a DR site or vice-versa.
+Relink Nutanix Cloud Manager (NCM) Self-Service (formerly Calm) applications to recovered user VMs after a disaster recovery (DR) failover or migrate between Prism Central instances.
 
----
+These scripts do not fail over workloads and do not run recovery plans. They repair Self-Service records so applications point at the recovered VMs.
 
-## Pre-requisites
+**Operator walkthrough:** [WORKFLOW.md](WORKFLOW.md)
 
-- **NCM Self-Service 4.2.0** (tested)
-- Python environment inside the NCM Self-Service VM (typically inside the `nucalm` container)
+## Prerequisites
 
----
+- Standalone NCM Self-Service VM; run inside `nucalm` after `activate`
+- **Tested:** 4.3.1 (`/home/calm/conf/version`), Python 3.9.25 in `venv3`
+- **Also supported:** 4.2.0 on the same `nucalm` layout (Python 3.6 or later). Start with `DRY_RUN=true`.
 
-## Script Overview
+## Scripts
 
-- **`pre-migration-script.py`**  
-  Takes `DEST_PC_IP`, `DEST_PC_USER`, `DEST_PC_PASS`, and `SOURCE_PROJECT_NAME` as environment variables.  
-  Recreates categories at the DR site based on source project applications.
+- `pre-migration-script.py` — recreate categories on the destination Prism Central from `SOURCE_PROJECT_NAME`
+- `post-migration-script.py` — relink applications to recovered VMs (interactive wizard by default)
+- `helper.py` — shared helpers; **do not execute** this file
 
-- **`post-migration-script.py`**  
-  Takes `DEST_PC_IP`, `DEST_PC_USER`, `DEST_PC_PASS`, and `DEST_PROJECT_NAME` as environment variables.  
-  Relinks NCM Self-Service Apps with failover VMs and updates the App's project.  
-  **Now includes VPC support**: Automatically detects and updates VPC tunnel VM references for apps deployed in VPC networks.
+Copy only those three files onto the NCM Self-Service VM. Do not copy `WORKFLOW.md` or `_archive/`.
 
-- **`helper.py`**  
-  Contains shared helper functions.  
-  **Do not execute this file directly.**
-
----
-
-## Required Environment Variables
+## Environment
 
 ```shell
-export DEST_PROJECT_NAME="<DEST_PROJECT_NAME>"
-export DEST_PC_IP="<PC_IP>"
-export DEST_PC_USER="<PC_USERNAME>"
-export DEST_PC_PASS="<PC_PASSWORD>"
-export SOURCE_PROJECT_NAME="<SOURCE_PROJECT_NAME>"
-export DRY_RUN=true/false
+export DEST_PC_IP="<destination Prism Central>"
+export DEST_PC_USER="<user>"
+read -rs DEST_PC_PASS
+export DEST_PC_PASS
+export SOURCE_PROJECT_NAME="<source project>"   # pre-migration
+export DRY_RUN=true                             # classify only; no writes
 ```
 
----
+Do not paste `DEST_PC_PASS` on one line. `docker exec` does not inherit environment variables from the SSH host; export them inside `(venv3)`.
 
-## Steps to execute
+Optional: `INSECURE` (default `true`), `RP_JOB_SCOPE` (default `prompt` — wizard, **not** every historical job), `RP_PLAN_NAME`, `RP_JOB_UUID`, `OTHER_PC_IP`. See [WORKFLOW.md](WORKFLOW.md).
+
+## Steps
+
 ```shell
-# SSH to NCM Self-Service VM
-# Docker exec to nucalm container
+# SSH to the standalone NCM Self-Service VM, then:
+docker cp helper.py nucalm:/tmp/
+docker cp pre-migration-script.py nucalm:/tmp/
+docker cp post-migration-script.py nucalm:/tmp/
+
 docker exec -it nucalm bash
 cd /tmp
 activate
 
-# Copy the files 'helper.py', 'pre-migration-script.py' & 'post-migration-script.py'
-
-# export required variables
-export DEST_PROJECT_NAME="<DEST_PROJECT_NAME>"
-export DEST_PC_IP="<PC_IP>"
-export DEST_PC_USER="<PC_USERNAME>"
-export DEST_PC_PASS="<PC_PASSWORD>"
-export SOURCE_PROJECT_NAME="<SOURCE_PROJECT_NAME>"
-export DRY_RUN=true/false
-
-python pre-migration-script.py
-python post-migration-script.py
+# export variables (above), then:
+python pre-migration-script.py    # before failover
+python post-migration-script.py   # after the job is COMPLETED or COMPLETED_WITH_WARNING
 ```
 
----
+Run first with `DRY_RUN=true`. Re-run with `DRY_RUN=false` only when the summary is correct.
 
-## VPC Network Support
+## Example Runs
 
-The post-migration script now includes **automatic VPC tunnel VM support** for applications deployed in VPC networks:
+<details>
+<summary>Pre-Migration</summary>
 
-- **Automatic Detection**: The script queries each subnet to determine if it's part of a VPC
-- **Safe Handling**: Works with both VPC-based subnets and regular VLAN-backed subnets
-- **Comprehensive Updates**: Updates VPC references across all app components:
-  - Substrate elements (NSE)
-  - Replica groups (NS) 
-  - Substrate configs (NSC)
-  - Action create tasks
-  - Clone blueprints
-  - Patch configurations
-- **No Manual Intervention**: VPC tunnel VM UUIDs are automatically updated after failover
+Categories on the destination Prism Central.
 
-### Technical Details
+<video controls playsinline preload="metadata" width="954" src="pre-migration.mp4">
+<a href="pre-migration.mp4">Download the pre-migration recording</a>
+</video>
 
-For VPC-based subnets, the script:
-1. Extracts subnet UUIDs from VM NIC configurations
-2. Queries the Prism Central API to get VPC references
-3. Updates `vpc_reference` fields alongside `subnet_reference` fields
-4. Skips VPC updates for non-VPC subnets (no errors thrown)
+</details>
 
----
+<details>
+<summary>Post-Migration</summary>
+
+Relink wizard.
+
+<video controls playsinline preload="metadata" width="954" src="post-migration.mp4">
+<a href="post-migration.mp4">Download the post-migration recording</a>
+</video>
+
+</details>
 
 ## Notes
 
-- These scripts have been tested with **NCM Self-Service 4.2.0**.
-- Set the environment variable `DRY_RUN=true` to perform a dry run (no changes will be made).
-- Review the logs for any warnings or errors after execution.
-- Do **not** run `helper.py` directly.
-- **VPC Support**: The script automatically handles both VPC and non-VPC subnets without requiring configuration.
+- Default `RP_JOB_SCOPE` is `prompt` (pick recovery plans and one unplanned-failover job per plan). The script does **not** ingest every historical job. Without an interactive terminal, set `RP_JOB_SCOPE=latest_per_plan` (or `all` / `job`).
+- Virtual private cloud (VPC) subnets: `vpc_reference` is updated when Prism returns it. VLAN-only subnets are unchanged.
