@@ -2643,7 +2643,7 @@ public class PrismGateStore {
         $requests = New-Object System.Collections.Generic.List[object]
         foreach ($item in $items)
         {
-            Write-Host "$(Get-Date) [STEP] Deleting $($item.Label) on $targetPc" -ForegroundColor Green
+            Write-Host "$(Get-Date) [INFO] Deleting $($item.Label) on $targetPc" -ForegroundColor Green
             $requests.Add([pscustomobject]@{
                 Id = [string]$item.Name
                 Method = 'DELETE'
@@ -3251,6 +3251,7 @@ Date       By              Updates (newest updates at the top)
 10/22/2026 nx-sbourdeaud  Compare source and target policy bodies by catalog name, ignoring identity fields and list order.
 10/22/2026 nx-sbourdeaud  Leave Outbound default rule out of a new policy so Prism can create it.
 10/22/2026 nx-sbourdeaud  Keep a custom Outbound default rule and omit only the Allow All, All Traffic rule.
+10/22/2026 nx-sbourdeaud  Report each delete as INFO so STEP stays reserved for section headers.
 
 ################################################################################
 '@
