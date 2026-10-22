@@ -2298,11 +2298,31 @@ public class PrismGateStore {
         return ,$sorted
     }
 
-    #Projects a desired PUT or a target policy onto the fields the sync writes.
-    #Reference UUID order is ignored. Rule order is kept. Description and extIds are left out.
+    #Categories have a key and a value. Address groups, service groups, and VPCs have a name.
+    function Get-CatalogObjectLabel
+    {
+        param($ExtId, $Catalog, [switch] $StripRenamePrefix)
+
+        $id = [string]$ExtId
+        if ([string]::IsNullOrEmpty($id)) { return $null }
+        $item = $null
+        if ($Catalog -and $Catalog.ContainsKey($id)) { $item = $Catalog[$id] }
+        if ($item -and $item.key -and $null -ne $item.value) { return "{0}:{1}" -f $item.key, $item.value }
+        if ($item -and -not [string]::IsNullOrEmpty([string]$item.name))
+        {
+            $label = [string]$item.name
+            $prefix = if ($StripRenamePrefix -and $rename) { "$rename`_" } else { "" }
+            if (-not [string]::IsNullOrEmpty($prefix) -and $label.StartsWith($prefix)) { $label = $label.Substring($prefix.Length) }
+            return $label
+        }
+        return "unresolved:$id"
+    }
+
+    #Builds the value compared between a source GET and a target GET.
+    #Identity fields are removed. Reference extIds become catalog names. Every list is ordered by its contents.
     function ConvertTo-ComparableNode
     {
-        param($Value)
+        param($Value, $Catalog, [switch] $StripRenamePrefix)
 
         if ($null -eq $Value) { return $null }
         if ($Value -is [string] -or $Value -is [System.ValueType]) { return $Value }
@@ -2315,6 +2335,10 @@ public class PrismGateStore {
             metadata = $true
             links = $true
             tenantId = $true
+            creationTime = $true
+            lastUpdateTime = $true
+            createdBy = $true
+            projectExtId = $true
         }
         $referenceNames = @{
             vpcReferences = $true
@@ -2339,8 +2363,22 @@ public class PrismGateStore {
                 if ($dropNames.ContainsKey($propertyName)) { continue }
                 $child = $Value.$propertyName
                 if ($null -eq $child) { continue }
-                if ($referenceNames.ContainsKey($propertyName)) { $result[$propertyName] = (Get-SortedIdList $child) }
-                else { $result[$propertyName] = ConvertTo-ComparableNode $child }
+                if ($referenceNames.ContainsKey($propertyName))
+                {
+                    $labels = New-Object System.Collections.Generic.List[string]
+                    foreach ($extId in (Get-EnumeratedItems $child))
+                    {
+                        $label = Get-CatalogObjectLabel -ExtId $extId -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+                        if ($label) { $labels.Add($label) }
+                    }
+                    $sortedLabels = @($labels | Sort-Object)
+                    $result[$propertyName] = $sortedLabels
+                }
+                else
+                {
+                    $converted = ConvertTo-ComparableNode -Value $child -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+                    if ($null -ne $converted) { $result[$propertyName] = $converted }
+                }
             }
             return $result
         }
@@ -2348,58 +2386,247 @@ public class PrismGateStore {
         $items = New-Object System.Collections.Generic.List[object]
         foreach ($item in (Get-EnumeratedItems $Value))
         {
-            if ($null -ne $item) { $items.Add((ConvertTo-ComparableNode $item)) }
+            if ($null -eq $item) { continue }
+            $items.Add((ConvertTo-ComparableNode -Value $item -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix))
         }
-        return ,$items.ToArray()
+        $sorted = @($items | Sort-Object { Get-ComparableSignature $_ })
+        return ,$sorted
+    }
+
+    function Get-ComparableSignature
+    {
+        param($Node)
+
+        if ($null -eq $Node) { return '<null>' }
+        if ($Node -is [string] -or $Node -is [System.ValueType]) { return (ConvertTo-Json $Node -Compress) }
+        return (ConvertTo-Json $Node -Depth 100 -Compress)
+    }
+
+    function Get-ComparableLabel
+    {
+        param($Node)
+
+        if ($null -eq $Node) { return '<null>' }
+        if ($Node -is [string] -or $Node -is [System.ValueType]) { return [string]$Node }
+        if ($Node -is [System.Collections.IDictionary])
+        {
+            if ($Node.Contains('type') -and $Node.Contains('description')) { return "{0} '{1}'" -f $Node['type'], $Node['description'] }
+            if ($Node.Contains('description')) { return "'{0}'" -f $Node['description'] }
+            if ($Node.Contains('startPort') -or $Node.Contains('endPort')) { return "ports $($Node['startPort'])-$($Node['endPort'])" }
+            if ($Node.Contains('type')) { return [string]$Node['type'] }
+        }
+        $signature = Get-ComparableSignature $Node
+        if ($signature.Length -gt 80) { return $signature.Substring(0, 80) }
+        return $signature
     }
 
     function ConvertTo-ComparablePolicy
     {
-        param($Policy)
+        param($Policy, $Catalog, [switch] $StripRenamePrefix)
 
-        $node = ConvertTo-ComparableNode $Policy
-        $rules = $node['rules']
-        if ($null -eq $rules) { $rules = @() }
-        elseif ($rules -isnot [System.Array]) { $rules = @($rules) }
-        $comparable = [ordered]@{
-            name = [string]$node['name']
-            type = [string]$node['type']
-            state = [string]$node['state']
-            isIpv6TrafficAllowed = [bool]$node['isIpv6TrafficAllowed']
-            isHitlogEnabled = [bool]$node['isHitlogEnabled']
-            rules = $rules
-        }
-        $scope = [string]$Policy.scope
-        $vpcCount = @(Get-SortedIdList $Policy.vpcReferences).Count
-        if ($scope -eq 'GLOBAL' -and $vpcCount -eq 0)
+        $data = $Policy
+        if ($Policy -and $Policy.data) { $data = $Policy.data }
+        $node = ConvertTo-ComparableNode -Value $data -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+        if ($null -eq $node) { $node = [ordered]@{} }
+        #The sync writes its own policy description, so that field cannot decide an update.
+        if ($node.Contains('description')) { [void]$node.Remove('description') }
+        if ($StripRenamePrefix -and $rename -and $node.Contains('name'))
         {
-            $comparable.scope = 'GLOBAL'
+            $prefix = "$rename`_"
+            $policyName = [string]$node['name']
+            if ($policyName.StartsWith($prefix)) { $node['name'] = $policyName.Substring($prefix.Length) }
         }
-        else
-        {
-            $comparable.vpcReferences = (Get-SortedIdList $Policy.vpcReferences)
-        }
-        return $comparable
+        return $node
     }
 
-    function Test-SyncedPolicyUnchanged
+    function Add-ListDifference
     {
-        param($Desired, $Target)
+        param($Left, $Right, [string] $Prefix, $Paths)
 
-        $desiredJson = ConvertTo-Json (ConvertTo-ComparablePolicy $Desired) -Depth 100 -Compress
-        $targetJson = ConvertTo-Json (ConvertTo-ComparablePolicy $Target) -Depth 100 -Compress
-        return $desiredJson -eq $targetJson
+        $leftBySignature = @{}
+        foreach ($item in (Get-EnumeratedItems $Left))
+        {
+            $signature = Get-ComparableSignature $item
+            if (-not $leftBySignature.ContainsKey($signature)) { $leftBySignature[$signature] = New-Object System.Collections.Generic.List[object] }
+            $leftBySignature[$signature].Add($item)
+        }
+        $rightBySignature = @{}
+        foreach ($item in (Get-EnumeratedItems $Right))
+        {
+            $signature = Get-ComparableSignature $item
+            if (-not $rightBySignature.ContainsKey($signature)) { $rightBySignature[$signature] = New-Object System.Collections.Generic.List[object] }
+            $rightBySignature[$signature].Add($item)
+        }
+
+        $leftOnly = New-Object System.Collections.Generic.List[object]
+        $rightOnly = New-Object System.Collections.Generic.List[object]
+        $signatures = New-Object System.Collections.Generic.List[string]
+        foreach ($signature in @($leftBySignature.Keys)) { if (-not $signatures.Contains($signature)) { [void]$signatures.Add($signature) } }
+        foreach ($signature in @($rightBySignature.Keys)) { if (-not $signatures.Contains($signature)) { [void]$signatures.Add($signature) } }
+        foreach ($signature in $signatures)
+        {
+            $leftCount = if ($leftBySignature.ContainsKey($signature)) { $leftBySignature[$signature].Count } else { 0 }
+            $rightCount = if ($rightBySignature.ContainsKey($signature)) { $rightBySignature[$signature].Count } else { 0 }
+            $shared = [Math]::Min($leftCount, $rightCount)
+            for ($i = $shared; $i -lt $leftCount; $i++) { $leftOnly.Add($leftBySignature[$signature][$i]) }
+            for ($i = $shared; $i -lt $rightCount; $i++) { $rightOnly.Add($rightBySignature[$signature][$i]) }
+        }
+        if ($leftOnly.Count -eq 0 -and $rightOnly.Count -eq 0) { return }
+
+        $leftByLabel = @{}
+        foreach ($item in (Get-EnumeratedItems $leftOnly))
+        {
+            $label = Get-ComparableLabel $item
+            if (-not $leftByLabel.ContainsKey($label)) { $leftByLabel[$label] = New-Object System.Collections.Generic.List[object] }
+            $leftByLabel[$label].Add($item)
+        }
+        $rightByLabel = @{}
+        foreach ($item in (Get-EnumeratedItems $rightOnly))
+        {
+            $label = Get-ComparableLabel $item
+            if (-not $rightByLabel.ContainsKey($label)) { $rightByLabel[$label] = New-Object System.Collections.Generic.List[object] }
+            $rightByLabel[$label].Add($item)
+        }
+        $labels = New-Object System.Collections.Generic.List[string]
+        foreach ($label in @($leftByLabel.Keys)) { if (-not $labels.Contains($label)) { [void]$labels.Add($label) } }
+        foreach ($label in @($rightByLabel.Keys)) { if (-not $labels.Contains($label)) { [void]$labels.Add($label) } }
+        $labels.Sort()
+        foreach ($label in $labels)
+        {
+            $leftItems = $null
+            $rightItems = $null
+            if ($leftByLabel.ContainsKey($label)) { $leftItems = $leftByLabel[$label] }
+            if ($rightByLabel.ContainsKey($label)) { $rightItems = $rightByLabel[$label] }
+            $leftCount = 0
+            $rightCount = 0
+            if ($null -ne $leftItems) { $leftCount = $leftItems.Count }
+            if ($null -ne $rightItems) { $rightCount = $rightItems.Count }
+            $next = "$Prefix[$label]"
+            if ($leftCount -eq 1 -and $rightCount -eq 1 -and $leftItems[0] -is [System.Collections.IDictionary] -and $rightItems[0] -is [System.Collections.IDictionary])
+            {
+                Add-ComparableDifference -Left $leftItems[0] -Right $rightItems[0] -Prefix $next -Paths $Paths
+            }
+            else
+            {
+                if ($leftCount -gt 0) { $Paths.Add("$next only on source") }
+                if ($rightCount -gt 0) { $Paths.Add("$next only on target") }
+            }
+        }
+    }
+
+    function Add-ComparableDifference
+    {
+        param($Left, $Right, [string] $Prefix, $Paths)
+
+        if ($null -eq $Left -and $null -eq $Right) { return }
+        $here = if ([string]::IsNullOrEmpty($Prefix)) { 'policy' } else { $Prefix }
+        if ($null -eq $Left -or $null -eq $Right)
+        {
+            $Paths.Add($here)
+            return
+        }
+
+        $leftList = $Left -is [System.Array]
+        $rightList = $Right -is [System.Array]
+        if ($leftList -and -not $rightList -and $Left.Length -eq 1)
+        {
+            Add-ComparableDifference -Left $Left[0] -Right $Right -Prefix $here -Paths $Paths
+            return
+        }
+        if ($rightList -and -not $leftList -and $Right.Length -eq 1)
+        {
+            Add-ComparableDifference -Left $Left -Right $Right[0] -Prefix $here -Paths $Paths
+            return
+        }
+
+        if ($Left -is [System.Collections.IDictionary] -and $Right -is [System.Collections.IDictionary])
+        {
+            $names = New-Object System.Collections.Generic.List[string]
+            foreach ($key in @($Left.Keys)) { if (-not $names.Contains([string]$key)) { [void]$names.Add([string]$key) } }
+            foreach ($key in @($Right.Keys)) { if (-not $names.Contains([string]$key)) { [void]$names.Add([string]$key) } }
+            $names.Sort()
+            foreach ($name in $names)
+            {
+                $next = if ([string]::IsNullOrEmpty($Prefix)) { $name } else { "$Prefix.$name" }
+                if ($Left.Contains($name) -and $Right.Contains($name))
+                {
+                    Add-ComparableDifference -Left $Left[$name] -Right $Right[$name] -Prefix $next -Paths $Paths
+                }
+                else
+                {
+                    $Paths.Add($next)
+                }
+            }
+            return
+        }
+
+        if ($leftList -and $rightList)
+        {
+            Add-ListDifference -Left $Left -Right $Right -Prefix $here -Paths $Paths
+            return
+        }
+
+        $leftJson = ConvertTo-Json $Left -Depth 100 -Compress
+        $rightJson = ConvertTo-Json $Right -Depth 100 -Compress
+        if ($leftJson -ne $rightJson) { $Paths.Add($here) }
+    }
+
+    function Get-PolicyDifferencePaths
+    {
+        param($Source, $Target, $SourceCatalog, $TargetCatalog)
+
+        if (-not $SourceCatalog) { $SourceCatalog = $script:SourceObjectCache }
+        if (-not $TargetCatalog) { $TargetCatalog = $script:TargetObjectByExtId }
+        $paths = New-Object System.Collections.Generic.List[string]
+        $left = ConvertTo-ComparablePolicy -Policy $Source -Catalog $SourceCatalog
+        $right = ConvertTo-ComparablePolicy -Policy $Target -Catalog $TargetCatalog -StripRenamePrefix
+        Add-ComparableDifference -Left $left -Right $right -Prefix '' -Paths $paths
+        return ,$paths.ToArray()
+    }
+
+    #Prism adds this rule for each secured group. A same-named rule with its own services or destinations is a user rule.
+    function Test-GeneratedOutboundDefaultRule
+    {
+        param($Rule)
+
+        if ([string]$Rule.description -ne 'Outbound default rule') { return $false }
+        $spec = $Rule.spec
+        if (-not $spec) { return $false }
+        if ([string]$spec.destAllowSpec -ne 'ALL') { return $false }
+        if ($spec.isAllProtocolAllowed -ne $true) { return $false }
+        foreach ($name in @('tcpServices','udpServices','icmpServices','serviceGroupReferences','destCategoryReferences','destAddressGroupReferences','srcCategoryReferences','srcAddressGroupReferences'))
+        {
+            foreach ($item in (Get-EnumeratedItems $spec.$name))
+            {
+                if ($null -ne $item -and -not [string]::IsNullOrEmpty([string]$item)) { return $false }
+            }
+        }
+        if (-not [string]::IsNullOrEmpty([string]$spec.srcAllowSpec)) { return $false }
+        if (-not [string]::IsNullOrEmpty([string]$spec.securedGroupAction)) { return $false }
+        return $true
     }
 
     function New-SyncedPolicyContent
     {
-        param($Policy, [string] $PolicyName)
+        param($Policy, [string] $PolicyName, [switch] $OmitGeneratedOutboundRules)
+        $rules = $Policy.data.rules
+        if ($OmitGeneratedOutboundRules)
+        {
+            $kept = New-Object System.Collections.Generic.List[object]
+            foreach ($rule in (Get-EnumeratedItems $rules))
+            {
+                if ($null -eq $rule) { continue }
+                if (Test-GeneratedOutboundDefaultRule $rule) { continue }
+                $kept.Add($rule)
+            }
+            $rules = $kept.ToArray()
+        }
         $content = @{
             name = $PolicyName
             type = $Policy.data.type
             description = "added by Invoke-FlowRuleSyncNG.ps1 script"
             state = $Policy.data.state
-            rules = $Policy.data.rules
+            rules = $rules
             isIpv6TrafficAllowed = $Policy.data.isIpv6TrafficAllowed
             isHitlogEnabled = $Policy.data.isHitlogEnabled
         }
@@ -3019,6 +3246,11 @@ Date       By              Updates (newest updates at the top)
 10/22/2026 nx-sbourdeaud  List source catalogs once and overlap category creates with later policy reads.
 10/22/2026 nx-sbourdeaud  Start MaxInFlight at 5 per Prism Central and lower a PC to 2 when it rate limits.
 10/22/2026 nx-sbourdeaud  Report each created object as its Prism call finishes instead of after the whole batch.
+10/22/2026 nx-sbourdeaud  Report each target policy as it is read for the update check.
+10/22/2026 nx-sbourdeaud  Ignore Prism's empty application-rule defaults and name the field that differs.
+10/22/2026 nx-sbourdeaud  Compare source and target policy bodies by catalog name, ignoring identity fields and list order.
+10/22/2026 nx-sbourdeaud  Leave Outbound default rule out of a new policy so Prism can create it.
+10/22/2026 nx-sbourdeaud  Keep a custom Outbound default rule and omit only the Allow All, All Traffic rule.
 
 ################################################################################
 '@
@@ -3272,6 +3504,14 @@ Date       By              Updates (newest updates at the top)
                 $script:TargetAddressGroupByName = $targetAgByName
                 $script:TargetServiceGroupByName = $targetSgByName
                 $script:TargetVpcByName = $targetVpcByName
+                $script:TargetObjectByExtId = @{}
+                foreach ($catalogName in @('address groups', 'service groups', 'cat', 'vpc'))
+                {
+                    foreach ($catalogItem in (Get-EnumeratedItems $fetched.Catalogs[$catalogName]))
+                    {
+                        if ($catalogItem -and $catalogItem.extId) { $script:TargetObjectByExtId[[string]$catalogItem.extId] = $catalogItem }
+                    }
+                }
 
                 $sourceCategoryCount = 0
                 foreach ($categoryKey in @($script:SourceCategoryIndex.Keys)) { $sourceCategoryCount += $script:SourceCategoryIndex[$categoryKey].Count }
@@ -3370,6 +3610,12 @@ Date       By              Updates (newest updates at the top)
                 Invoke-PendingCreates
                 Resolve-UnmappedCreates
                 Complete-PendingRenames
+                foreach ($work in (Get-EnumeratedItems $updateWork))
+                {
+                    if (-not $work -or -not $work.Policy) { continue }
+                    $sourceCopy = ConvertFrom-Json (ConvertTo-Json $work.Policy -Depth 100)
+                    $work | Add-Member -NotePropertyName SourcePolicy -NotePropertyValue $sourceCopy -Force
+                }
                 $syncWork = New-Object System.Collections.Generic.List[object]
                 foreach ($work in (Get-EnumeratedItems $addWork)) { $syncWork.Add($work) }
                 foreach ($work in (Get-EnumeratedItems $updateWork)) { $syncWork.Add($work) }
@@ -3392,7 +3638,7 @@ Date       By              Updates (newest updates at the top)
                             Id = [string]$work.Nsp.name
                             Method = 'POST'
                             Url = "https://$targetPc`:9440/api/microseg/v4.0/config/policies"
-                            Payload = (ConvertTo-Json (New-SyncedPolicyContent -Policy $work.Policy -PolicyName $policyname) -Depth 100)
+                            Payload = (ConvertTo-Json (New-SyncedPolicyContent -Policy $work.Policy -PolicyName $policyname -OmitGeneratedOutboundRules) -Depth 100)
                             NtnxReqId = [string](New-Guid)
                         })
                     }
@@ -3473,23 +3719,48 @@ Date       By              Updates (newest updates at the top)
                         $etagRequests.Add([pscustomobject]@{ Id = [string]$targetNsp.extId; Method = 'GET'; Url = $url; ReturnBodyAndETag = $true })
                     }
                     $putRequests = New-Object System.Collections.Generic.List[object]
-                    $unchanged = 0
-                    foreach ($result in @(Invoke-PrismRequestBatch -Requests $etagRequests))
-                    {
-                        if (-not $result.Ok) { Throw "$(Get-Date) [ERROR] Failed to read policy $($result.Id): $($result.Error)" }
-                        $update = $updateById[$result.Id]
-                        $targetData = $result.Body.Body.data
+                    $script:UpdateUnchanged = 0
+                    $script:UpdateReadDone = 0
+                    $updateReadTotal = $etagRequests.Count
+                    Invoke-PrismRequestBatch -Requests $etagRequests -OnResult {
+                        param($Result)
+                        if (-not $Result.Ok) { Throw "$(Get-Date) [ERROR] Failed to read policy $($Result.Id): $($Result.Error)" }
+                        $update = $updateById[$Result.Id]
+                        $targetData = $Result.Body.Body.data
                         if (-not $targetData) { Throw "$(Get-Date) [ERROR] Policy $($update.Work.Nsp.name) returned no body from $targetPc" }
+                        $script:UpdateReadDone++
+                        $progress = "$($script:UpdateReadDone) of $updateReadTotal"
                         $desired = New-SyncedPolicyContent -Policy $update.Work.Policy -PolicyName $update.PolicyName
-                        if (Test-SyncedPolicyUnchanged -Desired $desired -Target $targetData)
+                        if (-not $update.Work.SourcePolicy -or -not $update.Work.SourcePolicy.data)
                         {
-                            $unchanged++
-                            Write-Host "$(Get-Date) [INFO] Flow policy $($update.Work.Nsp.name) is unchanged on $targetPc" -ForegroundColor Green
-                            continue
+                            Throw "$(Get-Date) [ERROR] Flow policy $($update.Work.Nsp.name) has no source body to compare"
+                        }
+                        $differencePaths = Get-PolicyDifferencePaths -Source $update.Work.SourcePolicy.data -Target $targetData
+                        if ($differencePaths.Count -eq 0)
+                        {
+                            $script:UpdateUnchanged++
+                            Write-Host "$(Get-Date) [INFO] Flow policy $($update.Work.Nsp.name) is unchanged on $targetPc ($progress)" -ForegroundColor Green
+                            return
+                        }
+                        $shown = 0
+                        foreach ($path in $differencePaths)
+                        {
+                            if ($shown -ge 12) { break }
+                            Write-Host "$(Get-Date) [DATA] Flow policy $($update.Work.Nsp.name) differs in $path" -ForegroundColor White
+                            $shown++
+                        }
+                        $remaining = $differencePaths.Count - $shown
+                        if ($remaining -gt 0)
+                        {
+                            Write-Host "$(Get-Date) [DATA] Flow policy $($update.Work.Nsp.name) differs in $remaining more elements" -ForegroundColor White
                         }
                         if ($rename)
                         {
-                            Write-Host "$(Get-Date) [INFO] Updating Flow policy $($update.Work.Nsp.name) to $targetPc with new name $($update.PolicyName)" -ForegroundColor Cyan
+                            Write-Host "$(Get-Date) [INFO] Updating Flow policy $($update.Work.Nsp.name) to $targetPc with new name $($update.PolicyName) ($progress)" -ForegroundColor Cyan
+                        }
+                        else
+                        {
+                            Write-Host "$(Get-Date) [INFO] Flow policy $($update.Work.Nsp.name) will be updated on $targetPc ($progress)" -ForegroundColor Cyan
                         }
                         $putRequests.Add([pscustomobject]@{
                             Id = [string]$update.Work.Nsp.name
@@ -3497,10 +3768,10 @@ Date       By              Updates (newest updates at the top)
                             Url = $update.Url
                             Payload = (ConvertTo-Json $desired -Depth 100)
                             NtnxReqId = [string](New-Guid)
-                            IfMatch = [string]$result.Body.ETag
+                            IfMatch = [string]$Result.Body.ETag
                         })
-                    }
-                    Write-Host "$(get-date) [DATA] $unchanged Flow policies are unchanged on $targetPc" -ForegroundColor White
+                    } | Out-Null
+                    Write-Host "$(get-date) [DATA] $($script:UpdateUnchanged) Flow policies are unchanged on $targetPc" -ForegroundColor White
                     Write-Host "$(get-date) [DATA] $($putRequests.Count) Flow policies to update on $targetPc" -ForegroundColor White
                     if ($putRequests.Count -gt 0)
                     {
