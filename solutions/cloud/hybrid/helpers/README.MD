@@ -71,26 +71,65 @@ If the script runs correctly but does not produce the expected output, then the 
 
 Between multiple script executions, it may be necessary to re-initialize your PowerShell session (by closing and re-opening your PowerShell prompt).  The script tries to clear variables once it is done executing, but when execution fails for whatever reason, some variables may be left behind in memory which may affect any subsequent execution.
 
-# Sync-FlowRules.ps1:
+# Invoke-FlowRuleVPCSyncNG.ps1:
 
-## Export/Import Flow rules from one Prism Central instance to another
+The Invoke-FlowRuleVPCSyncNG.ps1 script synchronizes Nutanix Flow Network Security policies, and the categories, service groups, and address groups those policies use, from one Prism Central instance to another. It calls the Prism Central v4 APIs and supports policies whose scope is Global or a VPC. Use it when virtual machines are replicated to another availability zone and the Flow policies need to exist on the target before failover.
 
-You use _SyncFlowRules.ps1_ to export and import a number of Flow rules which follow a specified naming convention from/to Prism Central.
-The rules, but also their related categories, addresses and service groups (all Prism Central objects which are used in Flow rule definitions) are exported to **json** format.
-That **json** file can then be edited manually if required, then re-imported in the same or another Prism Central instance.
+## What the script does
 
-To export all Flow rules that start with _openshift_, run:
+The script reads from a source Prism Central and writes to a target Prism Central. Synchronization is one way.
 
- `SyncFlowRules.ps1 -pc pc1.local -prismCreds myadcreds -export -rules openshift*`
+It lists these objects on both Prism Centrals, following pagination so the result is not limited to the first page:
 
- Where **_pc_** is the IP address or fully qualified domain name of the Prism Central instance and **_prismCred_** is the name of the encrypted credential file (if that file does not already exist, you will be prompted for the credentials you want to use and the file will get created automatically for subsequent uses).  If you do not specify a credentials file name, you will simply be prompted for credentials.
- The script will display where the **json** export file was created (in the current directory).
+1. Flow policies, from `/api/microseg/v4.0/config/policies`
+2. Service groups, from `/api/microseg/v4.0/config/service-groups`
+3. Address groups, from `/api/microseg/v4.0/config/address-groups`
+4. Categories, from `/api/prism/v4.0.a2/config/categories`
+5. VPCs, from `/api/networking/v4.0/config/vpcs`
 
-To import Flow rules from a **json** file called _openshift.json_, run:
+Only policies whose names start with the **prefix** parameter are considered. Policies with scope `ALL_VLAN` are skipped.
 
-`SyncFlowRules.ps1 -pc pc2.local -prismCreds myadcreds -import -rules openshift*`
+With **-action sync**, the script then:
 
-If the required categories, addresses or service groups are missing from the target Prism Central instance, they will get created automatically so that the Flow rules can then be created successfully.
-If the rules already exist but have changed, they will get updated.
+1. _Adds_ a policy that exists on the source and not on the target.
+2. _Removes_ a policy that exists on the target, matches the prefix, and no longer exists on the source.
+3. _Updates_ a policy that exists on both sides when the policy content differs.
 
-To learn more about the script syntax and usage, you can use `get-help ./SyncFlowRules.ps1`
+Before a policy is created, the script creates any missing categories, service groups, and address groups, then rewrites the policy so it references those objects on the target. A category is matched by its key and value. A service group, address group, or VPC is matched by name. A system-defined service group is mapped when the target already has that name, and is not created. A VPC that is missing on the target is reported and is not created.
+
+An update compares the policy body read from the source with the policy body read from the target. Identity fields such as `extId`, `creationTime`, `lastUpdateTime`, `createdBy`, and `projectExtId` are ignored, and the order of rules and reference lists does not matter. When something still differs, the script prints the field as a `[DATA]` line and updates the target. When the two bodies match, the policy is left unchanged.
+
+On create, a rule named `Outbound default rule` is left out of the new policy when it is the stock rule Prism creates: outbound Allow All and allowed traffic All Traffic, with no service, category, or address selection of its own. Prism adds that rule for each secured group. A rule with the same name and custom entries is copied.
+
+The **rename** parameter adds a prefix to policy, address group, and service group names on the target. Use it once, before enabling Entity Sync for Flow. The **delete** action requires that prefix and removes the renamed policies, address groups, and service groups from the target.
+
+**MaxInFlight** is the number of Prism requests kept in flight for each Prism Central. It defaults to 5. A Prism Central that returns rate-limit responses repeatedly is lowered to 2 for the rest of the run, and that change is printed as a warning.
+
+Console lines are timestamped. `[STEP]` is magenta and marks a section. `[INFO]` is green. `[WARNING]` is yellow. `[ERROR]` is red and stops the script. `[DATA]` and `[DEBUG]` are white. `[SUCCESS]` is light blue. Pass **debugme** for debug lines, and **log** to write the same console output to a transcript in the working directory.
+
+## Technical requirements
+
+The script runs on Windows PowerShell 5.1 and on PowerShell 7. PowerShell 7 is the better choice on Windows, Linux, and macOS. It does not require an external PowerShell module.
+
+## Script syntax
+
+Show the syntax with `Get-Help ./Invoke-FlowRuleVPCSyncNG.ps1`.
+
+```powershell
+.\Invoke-FlowRuleVPCSyncNG.ps1 -sourcePc pc1.local -targetPc pc2.local -prismCreds myadcreds -action sync -prefix NVD
+```
+
+**sourcePc** and **targetPc** are the IP address or fully qualified domain name of each Prism Central. **prismCreds** is the name of an encrypted credential file. If that file does not exist, the script prompts for credentials and saves them for the next run. If you omit **prismCreds**, the script prompts on every run. The credential file can be decrypted only by the same user on the same workstation. The script prints the directory it uses, which depends on the operating system.
+
+**action** is `sync` or `delete`. **prefix** selects the source policies to synchronize. **rename** is the prefix added on the target. **MaxInFlight** accepts a value from 1 to 5.
+
+## Troubleshooting
+
+Pass **debugme** for additional console output, and **log** to keep a transcript in the working directory.
+
+When the script will not start, check the PowerShell version and confirm the workstation trusts the Prism Central certificate. The script skips certificate validation for the Prism Central connection. A Prism Central certificate that .NET rejects can still stop the connection.
+
+Start a new PowerShell process before running the script again in the same window after the script itself has been updated. The rate-limit gate is loaded once per process and cannot be replaced in that process.
+
+If the script runs and the policies on the target are not what you expect, try and create the same policy manually in Prism Central: a result that fails the same way outside the script is a Flow configuration issue rather than a script issue. Categories, service groups, and address groups used by a removed policy are left on the target. A missing VPC must exist on the target before a VPC-scoped policy can be synchronized.
+

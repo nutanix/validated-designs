@@ -24,6 +24,8 @@
 .PARAMETER rename
   Sync the policies in target PC with an added prefix to the name. Pass the prefix to be added to the name.
   Should be only used once before enabling Entity Sync Multi PC DR feature for Flow.
+.PARAMETER MaxInFlight
+  Maximum Prism requests kept in flight for each Prism Central. Defaults to 5, the large Prism Central limit. A Prism Central that returns rate-limit responses repeatedly is lowered to 2 for the rest of the run.
 .EXAMPLE
   .\Invoke-FlowRuleSync.ps1 -sourcePc pc1.local -targetPc pc2.local -prismCreds myadcreds -action sync -prefix flowPc1
   Synchronize all policies starting with flowPc1 from pc1 to pc2
@@ -48,7 +50,8 @@
         [parameter(mandatory = $false)] [string]$prefix,
     [parameter(mandatory = $false)][ValidateSet("sync", "delete")] [string]$action,
         [parameter(mandatory = $false)] [string]$rename,
-        [parameter(mandatory = $false)] $prismCreds
+        [parameter(mandatory = $false)] $prismCreds,
+        [parameter(mandatory = $false)] [ValidateRange(1,5)] [int]$MaxInFlight = 5
     )
 #endregion
 
@@ -468,7 +471,87 @@ public static void Ignore()
         }#endend
     }#end function Set-PoSHSSLCerts
 
+    #Builds a basic-auth header and frees the unmanaged password buffer.
+    function Get-BasicAuthHeaderValue
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)]
+            [System.Management.Automation.PSCredential]
+            $Credential
+        )
+
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+        try
+        {
+            $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            $token = "{0}:{1}" -f $Credential.UserName, $plain
+            $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($token))
+            return "Basic $encoded"
+        }
+        finally
+        {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+
+    function Get-HttpHeaderValue
+    {
+        param
+        (
+            $Headers,
+            [Parameter(Mandatory = $true)][string] $Name
+        )
+
+        if ($null -eq $Headers) { return $null }
+        $value = $null
+        try { $value = $Headers[$Name] } catch { $value = $null }
+        if (-not $value -and $Headers.PSObject.Properties[$Name])
+        {
+            $value = $Headers.PSObject.Properties[$Name].Value
+        }
+        if ($value -is [System.Array]) { $value = $value[0] }
+        if ($null -eq $value) { return $null }
+        return [string]$value
+    }
+
+    #OData string literals escape a single quote by doubling it. The query is then URL-encoded.
+    function ConvertTo-ODataStringLiteral
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)]
+            [AllowEmptyString()]
+            [string] $Value
+        )
+
+        return "'" + ($Value -replace "'", "''") + "'"
+    }
+
+    function ConvertTo-ODataFilterQuery
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)][string] $Expression
+        )
+
+        return '$filter=' + [uri]::EscapeDataString($Expression)
+    }
+
     #this function is used to make a REST api call to Prism
+    #Prism sometimes returns the body "undefined" or an empty body. That is not JSON.
+    function ConvertFrom-PrismResponse
+    {
+        param($Content)
+
+        if ($null -eq $Content) { return $null }
+        $text = if ($Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Content) } else { [string]$Content }
+        $trimmed = $text.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed -eq 'undefined' -or $trimmed -eq 'null') { return $null }
+        try { return ($trimmed | ConvertFrom-Json) }
+        catch { return $null }
+    }
+
     function Invoke-PrismAPICall
     {#makes a REST API call to Prism
         <#
@@ -515,89 +598,74 @@ public static void Ignore()
 
             [parameter(mandatory = $true)]
             [System.Management.Automation.PSCredential]
-            $credential
+            $credential,
+
+            [parameter(mandatory = $false)]
+            [switch]
+            $ReturnETag,
+
+            [parameter(mandatory = $false)]
+            [switch]
+            $ReturnBodyAndETag
         )
 
         begin
         {
-
+            $headers = @{
+                "Content-Type" = "application/json"
+                "Accept" = "application/json"
+            }
+            if ($if_match) { $headers["If-Match"] = $if_match }
+            if ($ntnx_req_id) { $headers["NTNX-Request-Id"] = $ntnx_req_id }
+            # Windows PowerShell 5 has no -Authentication parameter. Always send basic auth,
+            # including when NTNX-Request-Id or If-Match is set, and free the password BSTR.
+            $useBasicParameter = $PSVersionTable.PSVersion.Major -gt 5
+            if (-not $useBasicParameter) {
+                $headers["Authorization"] = Get-BasicAuthHeaderValue -Credential $credential
+            }
         }
 
         process
         {
-            Write-Host "$(Get-Date) [INFO] Making a $method call to $url" -ForegroundColor Green
+            if ($debugme) { Write-Host "$(Get-Date) [INFO] Making a $method call to $url" -ForegroundColor Green }
             try {
-                #check powershell version as PoSH 6 Invoke-RestMethod can natively skip SSL certificates checks and enforce Tls12 as well as use basic authentication with a pscredential object
-                if ($PSVersionTable.PSVersion.Major -gt 5)
+                if ($ReturnETag -or $ReturnBodyAndETag)
                 {
-                    if ($ntnx_req_id)
+                    if ($useBasicParameter)
                     {
-                        if ($if_match)
-                        {
-                            $headers = @{
-                                "Content-Type"="application/json"
-                                "Accept"="application/json"
-                                "If-Match"=$if_match
-                                "NTNX-Request-Id"=$ntnx_req_id
-                            }
-                        }
-                        else
-                        {
-                            $headers = @{
-                                "Content-Type"="application/json"
-                                "Accept"="application/json"
-                                "NTNX-Request-Id"=$ntnx_req_id
-                            }
-                        }
+                        $web = Invoke-WebRequest -Method $method -Uri $url -Headers $headers -SkipHeaderValidation -SkipCertificateCheck -SslProtocol Tls12 -Authentication Basic -Credential $credential -ErrorAction Stop
                     }
                     else
                     {
-                        $headers = @{
-                            "Content-Type"="application/json"
-                            "Accept"="application/json"
-                        }
+                        $web = Invoke-WebRequest -Method $method -Uri $url -Headers $headers -ErrorAction Stop
                     }
+                    $etag = Get-HttpHeaderValue -Headers $web.Headers -Name "ETag"
+                    if ([string]::IsNullOrEmpty($etag))
+                    {
+                        Throw "$(Get-Date) [ERROR] No ETag returned from $url"
+                    }
+                    if ($ReturnBodyAndETag)
+                    {
+                        $resp = [pscustomobject]@{ ETag = $etag; Body = (ConvertFrom-PrismResponse $web.Content) }
+                    }
+                    else
+                    {
+                        $resp = $etag
+                    }
+                }
+                elseif ($useBasicParameter)
+                {
                     if ($payload)
                     {
                         $resp = Invoke-RestMethod -Method $method -Uri $url -Headers $headers -Body $payload -SkipHeaderValidation -SkipCertificateCheck -SslProtocol Tls12 -Authentication Basic -Credential $credential -ErrorAction Stop
                     }
                     else
                     {
-                        $resp = Invoke-RestMethod -Method $method -Uri $url -Headers $headers -SkipCertificateCheck -SslProtocol Tls12 -Authentication Basic -Credential $credential -ErrorAction Stop
+                        $resp = Invoke-RestMethod -Method $method -Uri $url -Headers $headers -SkipHeaderValidation -SkipCertificateCheck -SslProtocol Tls12 -Authentication Basic -Credential $credential -ErrorAction Stop
                     }
                 }
                 else
                 {
-                    $username = $credential.UserName
-                    $password = $credential.Password
-                    if ($ntnx_req_id)
-                    {
-                        if ($if_match)
-                        {
-                            $headers = @{
-                                "Content-Type"="application/json"
-                                "Accept"="application/json"
-                                "If-Match"=$if_match
-                                "NTNX-Request-Id"=$ntnx_req_id
-                            }
-                        }
-                        else
-                        {
-                            $headers = @{
-                                "Content-Type"="application/json"
-                                "Accept"="application/json"
-                                "NTNX-Request-Id"=$ntnx_req_id
-                            }
-                        }
-                    }
-                    else
-                    {
-                        $headers = @{
-                            "Authorization" = "Basic "+[System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($username+":"+([System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($password))) ))
-                            "Content-Type"="application/json"
-                            "Accept"="application/json"
-                        }
-                    }
                     if ($payload)
                     {
                         $resp = Invoke-RestMethod -Method $method -Uri $url -Headers $headers -Body $payload -ErrorAction Stop
@@ -607,21 +675,38 @@ public static void Ignore()
                         $resp = Invoke-RestMethod -Method $method -Uri $url -Headers $headers -ErrorAction Stop
                     }
                 }
-                Write-Host "$(get-date) [SUCCESS] Call $method to $url succeeded." -ForegroundColor Cyan
-                if ($debugme) {Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White}
+                if ($debugme)
+                {
+                    Write-Host "$(get-date) [SUCCESS] Call $method to $url succeeded." -ForegroundColor Cyan
+                    if (-not $ReturnETag -and -not $ReturnBodyAndETag -and $resp.metadata) { Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White }
+                }
             }
             catch {
-                $saved_error = $_.Exception
-                $saved_error_message = ($_.ErrorDetails.Message | ConvertFrom-Json).message_list.message
-                $resp_return_code = $_.Exception.Response.StatusCode.value__
-                # Write-Host "$(Get-Date) [INFO] Headers: $($headers | ConvertTo-Json)"
-                if ($resp_return_code -eq 409)
+                $rawError = [string]$_.ErrorDetails.Message
+                $parsedError = ConvertFrom-PrismResponse $rawError
+                $saved_error_message = $null
+                if ($parsedError.message_list.message) { $saved_error_message = [string]$parsedError.message_list.message }
+                elseif ($parsedError.message) { $saved_error_message = [string]$parsedError.message }
+                elseif (-not [string]::IsNullOrWhiteSpace($rawError) -and $rawError.Trim() -ne 'undefined') { $saved_error_message = $rawError.Trim() }
+                $resp_return_code = $null
+                if ($_.Exception.Response) { $resp_return_code = $_.Exception.Response.StatusCode.value__ }
+                $jsonParseFailure = $_.Exception.Message -match 'Error parsing undefined value|Conversion from JSON failed'
+                $noHttpError = $null -eq $resp_return_code -or ($resp_return_code -ge 200 -and $resp_return_code -lt 300)
+                # A create can succeed and still return a non-JSON body. Callers look the new extId up by name.
+                if ($jsonParseFailure -and $noHttpError -and [string]::IsNullOrWhiteSpace($saved_error_message))
+                {
+                    Write-Host "$(Get-Date) [WARNING] $method $url returned no JSON body." -ForegroundColor Yellow
+                    if ($ReturnBodyAndETag) { $resp = [pscustomobject]@{ ETag = $null; Body = $null } }
+                    else { $resp = $null }
+                }
+                elseif ($resp_return_code -eq 409)
                 {
                     Write-Host "$(Get-Date) [WARNING] $saved_error_message" -ForegroundColor Yellow
                     Throw
                 }
                 else
                 {
+                    if ([string]::IsNullOrWhiteSpace($saved_error_message)) { $saved_error_message = $_.Exception.Message }
                     if ($saved_error_message -match 'Policy already exists')
                     {
                         Throw "$(get-date) [WARNING] $saved_error_message"
@@ -644,8 +729,194 @@ public static void Ignore()
         }
     }
 
-    #this function is used to apply rate limiting on each REST method which
-    #is 5 Msg/sec and at the end makes a REST api call to Prism
+    #Shared by every runspace. Each Prism Central starts at the configured MaxInFlight
+    #(5 for a large PC). Repeated rate-limit responses lower that PC to 2.
+    function Initialize-PrismRateGate
+    {
+        if ('PrismGateStore' -as [type])
+        {
+            if (-not [PrismGateStore].GetMethod('RecordRateLimit'))
+            {
+                Throw "Prism rate gate is already loaded without MaxInFlight adaptation. Start a new PowerShell process."
+            }
+            return
+        }
+        Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+using System.Collections.Concurrent;
+
+public class PrismHostPace {
+    readonly object sync = new object();
+    int limit;
+    int hits;
+    int reduced;
+    const int StrikeLimit = 3;
+
+    public PrismHostPace(int initial) { limit = initial; }
+
+    public int Limit {
+        get { lock (sync) { return limit; } }
+    }
+
+    // Returns the previous limit when this call lowers the host, otherwise 0.
+    public int RecordRateLimit(int floor) {
+        lock (sync) {
+            if (reduced == 1) return 0;
+            hits++;
+            if (hits >= StrikeLimit && limit > floor) {
+                int previous = limit;
+                limit = floor;
+                reduced = 1;
+                hits = 0;
+                return previous;
+            }
+            return 0;
+        }
+    }
+
+    public void RecordSuccess() {
+        lock (sync) {
+            if (reduced == 1) return;
+            if (hits > 0) hits--;
+        }
+    }
+}
+
+public class PrismRateBucket {
+    readonly PrismHostPace pace;
+    readonly object sync = new object();
+    int held;
+    DateTime windowStart = DateTime.UtcNow;
+    int started;
+
+    public PrismRateBucket(PrismHostPace pace) { this.pace = pace; }
+
+    public void Enter() {
+        while (true) {
+            int sleepMs = 0;
+            lock (sync) {
+                int cap = pace.Limit;
+                if (cap < 1) cap = 1;
+                DateTime now = DateTime.UtcNow;
+                double elapsed = (now - windowStart).TotalSeconds;
+                if (elapsed >= 1) {
+                    windowStart = now;
+                    started = 0;
+                    elapsed = 0;
+                }
+                if (held < cap && started < cap) {
+                    held++;
+                    started++;
+                    return;
+                }
+                if (held >= cap) sleepMs = 20;
+                else {
+                    sleepMs = (int)Math.Ceiling((1 - elapsed) * 1000);
+                    if (sleepMs < 1) sleepMs = 1;
+                }
+            }
+            Thread.Sleep(sleepMs);
+        }
+    }
+
+    public void Exit() {
+        lock (sync) {
+            if (held > 0) held--;
+        }
+    }
+}
+
+public class PrismGateStore {
+    static int defaultLimit = 5;
+    const int SmallPcLimit = 2;
+    static readonly ConcurrentDictionary<string, PrismHostPace> hosts = new ConcurrentDictionary<string, PrismHostPace>();
+    static readonly ConcurrentDictionary<string, PrismRateBucket> buckets = new ConcurrentDictionary<string, PrismRateBucket>();
+
+    public static void SetDefaultLimit(int limit) {
+        if (limit < 1) limit = 1;
+        if (limit > 5) limit = 5;
+        defaultLimit = limit;
+    }
+
+    public static PrismHostPace Host(string host) {
+        return hosts.GetOrAdd(host, h => new PrismHostPace(defaultLimit));
+    }
+
+    public static int GetLimit(string host) {
+        return Host(host).Limit;
+    }
+
+    public static int RecordRateLimit(string host) {
+        return Host(host).RecordRateLimit(SmallPcLimit);
+    }
+
+    public static void RecordSuccess(string host) {
+        Host(host).RecordSuccess();
+    }
+
+    public static PrismRateBucket Get(string key) {
+        return buckets.GetOrAdd(key, k => {
+            string host = k.Split('|')[0];
+            return new PrismRateBucket(Host(host));
+        });
+    }
+}
+'@
+    }
+
+    function Get-PrismRateBucket
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)][string] $Url,
+            [Parameter(Mandatory = $true)][string] $Method
+        )
+
+        if (-not ('PrismGateStore' -as [type])) { Initialize-PrismRateGate }
+        $key = "{0}|{1}" -f ([uri]$Url).Host, $Method.ToUpperInvariant()
+        return [PrismGateStore]::Get($key)
+    }
+
+    function Initialize-PrismRunspacePool
+    {
+        if ($script:PrismRunspacePool) { return }
+        Initialize-PrismRateGate
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        foreach ($name in @('Get-BasicAuthHeaderValue','Get-HttpHeaderValue','ConvertFrom-PrismResponse','Invoke-PrismAPICall','Initialize-PrismRateGate','Get-PrismRateBucket','Test-PrismRateLimited','Invoke-RateLimitedApiCall'))
+        {
+            $definition = (Get-Item -Path "function:$name").Definition
+            $entry = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($name, $definition)
+            [void]$iss.Commands.Add($entry)
+        }
+        $debugEntry = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('debugme', [bool]$debugme, $null)
+        [void]$iss.Variables.Add($debugEntry)
+        $pool = [runspacefactory]::CreateRunspacePool($iss)
+        [void]$pool.SetMinRunspaces(1)
+        [void]$pool.SetMaxRunspaces(10)
+        $pool.Open()
+        $script:PrismRunspacePool = $pool
+    }
+
+    function Close-PrismRunspacePool
+    {
+        if ($script:PrismRunspacePool)
+        {
+            $script:PrismRunspacePool.Close()
+            $script:PrismRunspacePool.Dispose()
+            $script:PrismRunspacePool = $null
+        }
+    }
+
+    function Test-PrismRateLimited
+    {
+        param([string] $Message)
+        return $Message -match '(?i)(\[ERROR\]\s*429\b|429\s*\(Too Many Requests\)|rate[\s-]?limit|too many requests|throttl)'
+    }
+
+    #One HTTP call on the current thread, using the shared gate.
+    #A rate-limited call is retried. Three such responses lower that Prism Central to 2.
+    #A 504 upstream timeout is retried the same number of times and does not change MaxInFlight.
     function Invoke-RateLimitedApiCall
     {
         [CmdletBinding()]
@@ -656,49 +927,395 @@ public static void Ignore()
             [Parameter(Mandatory = $true)][PSCredential] $credential,
             [Parameter()][string] $payload,
             [Parameter()][string] $ntnx_req_id,
-            [Parameter()][string] $if_match
+            [Parameter()][string] $if_match,
+            [Parameter()][switch] $ReturnETag,
+            [Parameter()][switch] $ReturnBodyAndETag
         )
 
-        # Hardcoded rate limit per method
-        $maxPerSecond = 5
-
-        # Global per-method tracker
-        if (-not $script:RateLimitMap)
+        $pc = ([uri]$url).Host
+        $maxAttempts = 6
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++)
         {
-            $script:RateLimitMap = @{}
+            $bucket = Get-PrismRateBucket -Url $url -Method $method
+            $wait = [System.Diagnostics.Stopwatch]::StartNew()
+            $bucket.Enter()
+            if ($wait.ElapsedMilliseconds -gt 50)
+            {
+                Write-Host "$(Get-Date) [WARNING] [$method $pc] Waited $($wait.ElapsedMilliseconds) ms for a Prism rate-limit slot." -ForegroundColor Yellow
+            }
+            try
+            {
+                $result = Invoke-PrismAPICall -method $method -url $url -credential $credential -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match -ReturnETag:$ReturnETag -ReturnBodyAndETag:$ReturnBodyAndETag
+                [PrismGateStore]::RecordSuccess($pc)
+                return $result
+            }
+            catch
+            {
+                $detail = [string]$_.Exception.Message
+                $rateLimited = Test-PrismRateLimited -Message $detail
+                $upstreamTimeout = $detail -match '(?i)(\[ERROR\]\s*504\b|upstream request timeout)'
+                if ($rateLimited)
+                {
+                    $previous = [PrismGateStore]::RecordRateLimit($pc)
+                    if ($previous -gt 0)
+                    {
+                        $currentLimit = [PrismGateStore]::GetLimit($pc)
+                        Write-Host "$(Get-Date) [WARNING] MaxInFlight for $pc changed from $previous to $currentLimit after repeated Prism rate-limit responses." -ForegroundColor Yellow
+                    }
+                }
+                if ((-not $rateLimited -and -not $upstreamTimeout) -or $attempt -ge $maxAttempts) { throw }
+                if ($upstreamTimeout)
+                {
+                    Write-Host "$(Get-Date) [WARNING] [$method $pc] 504 upstream request timeout. Retrying attempt $($attempt + 1) of $maxAttempts." -ForegroundColor Yellow
+                }
+            }
+            finally
+            {
+                $bucket.Exit()
+            }
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    #Runs independent Prism calls on a runspace pool. Map updates stay on the caller.
+    #MaxInFlight 0 uses the live per-Prism-Central limit, which starts at 5 and can drop to 2.
+    function Invoke-PrismRequestBatch
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)] $Requests,
+            [int] $MaxInFlight = 0,
+            [ValidateSet('Stop','Continue')][string] $BatchErrorAction = 'Stop',
+            [scriptblock] $OnResult
+        )
+
+        $requestSnapshot = @($Requests | Where-Object { $_ })
+        $pendingInput = New-Object System.Collections.Generic.Queue[object]
+        $orderedIds = New-Object System.Collections.Generic.List[string]
+        foreach ($request in $requestSnapshot)
+        {
+            $pendingInput.Enqueue($request)
+            $orderedIds.Add([string]$request.Id)
+        }
+        $resultsById = @{}
+        if ($pendingInput.Count -eq 0)
+        {
+            return
         }
 
-        if (-not $script:RateLimitMap.ContainsKey($method))
+        if ($pendingInput.Count -eq 1)
         {
-            $script:RateLimitMap[$method] = @{
-                Counter   = 0
-                StartTime = Get-Date
+            $only = $pendingInput.Dequeue()
+            try
+            {
+                $body = Invoke-RateLimitedApiCall -method $only.Method -url $only.Url -credential $prismCredentials -payload $only.Payload -ntnx_req_id $only.NtnxReqId -if_match $only.IfMatch -ReturnETag:([bool]$only.ReturnETag) -ReturnBodyAndETag:([bool]$only.ReturnBodyAndETag)
+                $resultsById[[string]$only.Id] = [pscustomobject]@{ Ok = $true; Id = [string]$only.Id; Body = $body; Error = $null }
+            }
+            catch
+            {
+                if ($BatchErrorAction -eq 'Stop') { throw }
+                $resultsById[[string]$only.Id] = [pscustomobject]@{ Ok = $false; Id = [string]$only.Id; Body = $null; Error = $_.Exception.Message }
+            }
+            if ($OnResult) { & $OnResult $resultsById[[string]$only.Id] }
+        }
+        else
+        {
+            Initialize-PrismRunspacePool
+            $worker = {
+                param($Request, $Credential)
+                try
+                {
+                    $params = @{
+                        method = [string]$Request.Method
+                        url = [string]$Request.Url
+                        credential = $Credential
+                    }
+                    if ($Request.Payload) { $params.payload = [string]$Request.Payload }
+                    if ($Request.NtnxReqId) { $params.ntnx_req_id = [string]$Request.NtnxReqId }
+                    if ($Request.IfMatch) { $params.if_match = [string]$Request.IfMatch }
+                    if ($Request.ReturnETag) { $params.ReturnETag = $true }
+                    if ($Request.ReturnBodyAndETag) { $params.ReturnBodyAndETag = $true }
+                    $body = Invoke-RateLimitedApiCall @params
+                    return [pscustomobject]@{ Ok = $true; Id = [string]$Request.Id; Body = $body; Error = $null }
+                }
+                catch
+                {
+                    return [pscustomobject]@{ Ok = $false; Id = [string]$Request.Id; Body = $null; Error = $_.Exception.Message }
+                }
+            }
+
+            $running = New-Object System.Collections.Generic.List[object]
+            $runningByHost = @{}
+            $stopScheduling = $false
+            $firstError = $null
+            while (($pendingInput.Count -gt 0 -and -not $stopScheduling) -or $running.Count -gt 0)
+            {
+                while ($pendingInput.Count -gt 0 -and -not $stopScheduling)
+                {
+                    $slotCap = 10
+                    if ($MaxInFlight -gt 0) { $slotCap = $MaxInFlight }
+                    if ($running.Count -ge $slotCap) { break }
+
+                    $selected = $null
+                    $selectedHost = $null
+                    $deferred = New-Object System.Collections.Generic.Queue[object]
+                    while ($pendingInput.Count -gt 0 -and -not $selected)
+                    {
+                        $candidate = $pendingInput.Dequeue()
+                        $candidateHost = ([uri]$candidate.Url).Host
+                        $used = 0
+                        if ($runningByHost.ContainsKey($candidateHost)) { $used = [int]$runningByHost[$candidateHost] }
+                        $hostLimit = [PrismGateStore]::GetLimit($candidateHost)
+                        if ($MaxInFlight -gt 0 -and $MaxInFlight -lt $hostLimit) { $hostLimit = $MaxInFlight }
+                        if ($used -lt $hostLimit)
+                        {
+                            $selected = $candidate
+                            $selectedHost = $candidateHost
+                        }
+                        else
+                        {
+                            $deferred.Enqueue($candidate)
+                        }
+                    }
+                    while ($deferred.Count -gt 0) { $pendingInput.Enqueue($deferred.Dequeue()) }
+                    if (-not $selected) { break }
+
+                    $ps = [powershell]::Create()
+                    $ps.RunspacePool = $script:PrismRunspacePool
+                    [void]$ps.AddScript([string]$worker).AddArgument($selected).AddArgument($prismCredentials)
+                    $handle = $ps.BeginInvoke()
+                    if (-not $runningByHost.ContainsKey($selectedHost)) { $runningByHost[$selectedHost] = 0 }
+                    $runningByHost[$selectedHost] = [int]$runningByHost[$selectedHost] + 1
+                    $running.Add([pscustomobject]@{ PowerShell = $ps; Handle = $handle; Id = [string]$selected.Id; Host = $selectedHost })
+                }
+
+                $finished = @($running | Where-Object { $_.Handle.IsCompleted })
+                if ($finished.Count -eq 0)
+                {
+                    Start-Sleep -Milliseconds 20
+                    continue
+                }
+
+                foreach ($done in $finished)
+                {
+                    [void]$running.Remove($done)
+                    if ($done.Host -and $runningByHost.ContainsKey($done.Host) -and [int]$runningByHost[$done.Host] -gt 0)
+                    {
+                        $runningByHost[$done.Host] = [int]$runningByHost[$done.Host] - 1
+                    }
+                    $result = $null
+                    try
+                    {
+                        $output = @($done.PowerShell.EndInvoke($done.Handle) | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Ok' })
+                        if ($output.Count -gt 0) { $result = $output[-1] }
+                        if (-not $result)
+                        {
+                            $streamError = @($done.PowerShell.Streams.Error) | Select-Object -First 1
+                            $message = if ($streamError) { [string]$streamError } else { "Prism call $($done.Id) returned no result." }
+                            $result = [pscustomobject]@{ Ok = $false; Id = $done.Id; Body = $null; Error = $message }
+                        }
+                    }
+                    catch
+                    {
+                        $result = [pscustomobject]@{ Ok = $false; Id = $done.Id; Body = $null; Error = $_.Exception.Message }
+                    }
+                    finally
+                    {
+                        $done.PowerShell.Dispose()
+                    }
+
+                    $resultsById[$result.Id] = $result
+                    if (-not $result.Ok -and $BatchErrorAction -eq 'Stop' -and -not $firstError)
+                    {
+                        $firstError = $result.Error
+                        $stopScheduling = $true
+                    }
+                    elseif ($OnResult -and -not $firstError)
+                    {
+                        try { & $OnResult $result }
+                        catch
+                        {
+                            if (-not $firstError) { $firstError = [string]$_.Exception.Message }
+                            $stopScheduling = $true
+                        }
+                    }
+                }
+            }
+
+            foreach ($leftover in $running.ToArray())
+            {
+                try { $leftover.PowerShell.Stop() } catch {}
+                $leftover.PowerShell.Dispose()
+            }
+            if ($firstError) { Throw $firstError }
+        }
+
+        $ordered = New-Object System.Collections.Generic.List[object]
+        foreach ($id in $orderedIds)
+        {
+            if ($resultsById.ContainsKey($id)) { $ordered.Add($resultsById[$id]) }
+        }
+        foreach ($item in $ordered) { Write-Output $item }
+    }
+
+    function Get-PrismListUrl
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)][string] $Pc,
+            [string] $Object,
+            [string] $ApiPath,
+            [int] $Page = 0,
+            [int] $Limit = 100
+        )
+
+        if ($ApiPath)
+        {
+            $baseUrl = "https://{0}:9440/{1}" -f $Pc, $ApiPath.TrimStart('/')
+        }
+        else
+        {
+            $baseUrl = "https://{0}:9440/api/microseg/v4.0/config/{1}" -f $Pc, $Object
+        }
+        $sep = if ($baseUrl -match '\?') { '&' } else { '?' }
+        return "$baseUrl${sep}%24page=$Page&%24limit=$Limit"
+    }
+
+    function ConvertTo-PageItems
+    {
+        param($Response)
+
+        $pageItems = New-Object System.Collections.Generic.List[object]
+        if ($Response -and $Response.data)
+        {
+            foreach ($item in @($Response.data))
+            {
+                if ($null -ne $item) { $pageItems.Add($item) }
+            }
+        }
+        return $pageItems
+    }
+
+    #Fetches one or more paged lists. Page 0 of every list shares a batch, then the remaining pages do too.
+    #ExtraRequests ride along with page 0 so source reads can overlap target reads.
+    function Get-PrismCatalogs
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)] $Catalogs,
+            $ExtraRequests,
+            [int] $Limit = 100
+        )
+
+        $page0 = New-Object System.Collections.Generic.List[object]
+        foreach ($catalog in @($Catalogs))
+        {
+            $page0.Add([pscustomobject]@{
+                Id = "$($catalog.Key)|0"
+                Method = 'GET'
+                Url = (Get-PrismListUrl -Pc $catalog.Pc -Object $catalog.Object -ApiPath $catalog.ApiPath -Page 0 -Limit $Limit)
+            })
+        }
+        foreach ($extra in (Get-EnumeratedItems $ExtraRequests))
+        {
+            if ($extra) { $page0.Add($extra) }
+        }
+
+        $firstResults = @(Invoke-PrismRequestBatch -Requests $page0 -BatchErrorAction Continue)
+        $byId = @{}
+        foreach ($result in $firstResults) { $byId[[string]$result.Id] = $result }
+
+        $more = New-Object System.Collections.Generic.List[object]
+        $state = @{}
+        foreach ($catalog in @($Catalogs))
+        {
+            $pageResult = $byId["$($catalog.Key)|0"]
+            if (-not $pageResult -or -not $pageResult.Ok)
+            {
+                $reason = if ($pageResult) { $pageResult.Error } else { "missing page 0 for $($catalog.Key)" }
+                Throw "$(Get-Date) [ERROR] Failed to list $($catalog.Key): $reason"
+            }
+            $items = ConvertTo-PageItems -Response $pageResult.Body
+            $total = 0
+            if ($pageResult.Body.metadata -and $null -ne $pageResult.Body.metadata.totalAvailableResults)
+            {
+                $total = [int]$pageResult.Body.metadata.totalAvailableResults
+            }
+            if ($items.Count -eq 0)
+            {
+                Write-Host "$(Get-Date) [WARNING] No data received from $($catalog.Pc) for $($catalog.Key)." -ForegroundColor Yellow
+            }
+            $state[$catalog.Key] = @{ Items = $items; Total = $total; Sequential = $false }
+            if ($total -gt $items.Count)
+            {
+                $pageCount = [int][Math]::Ceiling($total / $Limit)
+                for ($page = 1; $page -lt $pageCount; $page++)
+                {
+                    $more.Add([pscustomobject]@{
+                        Id = "$($catalog.Key)|$page"
+                        Method = 'GET'
+                        Url = (Get-PrismListUrl -Pc $catalog.Pc -Object $catalog.Object -ApiPath $catalog.ApiPath -Page $page -Limit $Limit)
+                    })
+                }
+            }
+            elseif ($total -eq 0 -and $items.Count -eq $Limit)
+            {
+                $state[$catalog.Key].Sequential = $true
             }
         }
 
-        $rateState = $script:RateLimitMap[$method]
-        $now = Get-Date
-        $elapsed = ($now - $rateState.StartTime).TotalSeconds
-
-        if ($elapsed -ge 1)
+        if ($more.Count -gt 0)
         {
-            # Reset every 1 second
-            $rateState.Counter = 0
-            $rateState.StartTime = $now
+            foreach ($result in @(Invoke-PrismRequestBatch -Requests $more))
+            {
+                $byId[[string]$result.Id] = $result
+            }
         }
 
-        if ($rateState.Counter -ge $maxPerSecond)
+        $catalogsOut = @{}
+        foreach ($catalog in @($Catalogs))
         {
-            Write-Host "$(Get-Date) [WARNING] [$method] Reached $maxPerSecond req/sec. Sleeping 1 second..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 1
-            $rateState.Counter = 0
-            $rateState.StartTime = Get-Date
+            $catalogState = $state[$catalog.Key]
+            $all = New-Object System.Collections.Generic.List[object]
+            foreach ($item in $catalogState.Items) { $all.Add($item) }
+            if ($catalogState.Total -gt $catalogState.Items.Count)
+            {
+                $pageCount = [int][Math]::Ceiling($catalogState.Total / $Limit)
+                for ($page = 1; $page -lt $pageCount; $page++)
+                {
+                    $pageResult = $byId["$($catalog.Key)|$page"]
+                    if (-not $pageResult -or -not $pageResult.Ok)
+                    {
+                        $reason = if ($pageResult) { $pageResult.Error } else { "missing page $page for $($catalog.Key)" }
+                        Throw "$(Get-Date) [ERROR] Failed to list $($catalog.Key) page ${page}: $reason"
+                    }
+                    foreach ($item in (ConvertTo-PageItems -Response $pageResult.Body)) { $all.Add($item) }
+                }
+            }
+            elseif ($catalogState.Sequential)
+            {
+                $page = 1
+                while ($true)
+                {
+                    $url = Get-PrismListUrl -Pc $catalog.Pc -Object $catalog.Object -ApiPath $catalog.ApiPath -Page $page -Limit $Limit
+                    $resp = Invoke-RateLimitedApiCall -method GET -url $url -credential $prismCredentials
+                    $pageItems = ConvertTo-PageItems -Response $resp
+                    if ($pageItems.Count -eq 0) { break }
+                    foreach ($item in $pageItems) { $all.Add($item) }
+                    if ($pageItems.Count -lt $Limit) { break }
+                    $page++
+                }
+            }
+            $catalogsOut[$catalog.Key] = $all
         }
 
-        $rateState.Counter++
-        $script:RateLimitMap[$method] = $rateState
-
-        return Invoke-PrismAPICall -method $method -url $url -credential $credential -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
+        $extrasOut = @{}
+        foreach ($extra in (Get-EnumeratedItems $ExtraRequests))
+        {
+            if (-not $extra) { continue }
+            $extrasOut[[string]$extra.Id] = $byId[[string]$extra.Id]
+        }
+        return [pscustomobject]@{ Catalogs = $catalogsOut; Extras = $extrasOut }
     }
 
 
@@ -718,62 +1335,18 @@ public static void Ignore()
 
     function Get-MicrosegObjectList
     {
-        [CmdletBinding()]
+        [CmdletBinding(DefaultParameterSetName = 'MicrosegObject')]
         param(
             [Parameter(Mandatory = $true)][string] $pc,
-            [Parameter(Mandatory = $true)][string] $object
+            [Parameter(Mandatory = $true, ParameterSetName = 'MicrosegObject')][string] $object,
+            [Parameter(Mandatory = $true, ParameterSetName = 'ApiPath')][string] $apiPath
         )
 
-        begin {
-            $page = 0
-            $limit = 100
-            $totalAvailable = 0
-            [System.Collections.ArrayList]$results = @()
-
-            $baseUrl = "https://{0}:9440/api/microseg/v4.0/config/{1}" -f $pc, $object
-            $method = "GET"
-        }
-
-        process {
-            do {
-                try {
-                    # Add correct query separator if needed
-                    $sep = if ($baseUrl -match '\?') { '&' } else { '?' }
-
-                    # Use encoded parameters %24page and %24limit to substitute $
-                    # which is needed in V4 API odata format for limit and pag query
-                    $url = "$baseUrl${sep}%24page=$page&%24limit=$limit"
-
-                    Write-Host "$(Get-Date) [INFO] Calling URL: $url" -ForegroundColor Cyan
-                    $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                    if (-not $resp -or -not $resp.data) {
-                        Write-Host "$(Get-Date) [WARNING] No data received." -ForegroundColor Yellow
-                        break
-                    }
-
-                    # Get total available policies from metadata
-                    if ($totalAvailable -eq 0 -and $resp.metadata.totalAvailableResults) {
-                        $totalAvailable = $resp.metadata.totalAvailableResults
-                        Write-Host "$(Get-Date) [INFO] Total available results: $totalAvailable" -ForegroundColor Green
-                    }
-
-                    # Add current page data
-                    $results.AddRange($resp.data)
-                    Write-Host "$(Get-Date) [INFO] Retrieved $($resp.data.Count) objects (Total so far: $($results.Count))" -ForegroundColor Green
-
-                    $page++
-                }
-                catch {
-                    Throw "$(Get-Date) [ERROR] $($_.Exception.Message)"
-                }
-            }
-            while ($results.Count -lt $totalAvailable)
-        }
-
-        end {
-            return $results
-        }
+        $catalog = @{ Key = 'list'; Pc = $pc }
+        if ($PSCmdlet.ParameterSetName -eq 'ApiPath') { $catalog.ApiPath = $apiPath }
+        else { $catalog.Object = $object }
+        $fetched = Get-PrismCatalogs -Catalogs @($catalog)
+        return $fetched.Catalogs['list']
     }
 
     function Get-PrismCentralTaskStatus
@@ -867,7 +1440,7 @@ public static void Ignore()
     }
 
     function Get-CategoryByExtId
-    {#retrieves Category object v4
+    {#retrieves Category object v4. Returns the category data (key, value, extId) and caches it for the run.
         [CmdletBinding()]
         param
         (
@@ -877,39 +1450,56 @@ public static void Ignore()
 
         begin
         {
+            if (-not $script:SourceObjectCache) { $script:SourceObjectCache = @{} }
+            $result = $null
             $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories/{1}" -f $pc,$extId
             $method = "GET"
         }
 
         process
         {
-            try {
-                $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                if ($debugme) {Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White}
-
-                $category_value_pair = "$($resp.data.key):$($resp.data.value)"
+            if ($script:MissingSourceExtIds -and $script:MissingSourceExtIds.ContainsKey($extId))
+            {
+                $result = $null
             }
-            catch {
-                $saved_error = $_.Exception.Message
-                $error_code = ($saved_error -split " ")[3]
-                if ($error_code -eq "404")
-                {
-                    Write-Host "$(get-date) [WARNING] The category extId specified ($extId) does not exist in Prism Central $pc" -ForegroundColor Yellow
-                }
-                else
-                {
-                    Write-Host "$saved_error" -ForegroundColor Yellow
-                }
+            elseif ($script:SourceObjectCache.ContainsKey($extId))
+            {
+                $result = $script:SourceObjectCache[$extId]
             }
-            finally {
-                #add any last words here; this gets processed no matter what
+            else
+            {
+                try {
+                    $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
+
+                    if ($debugme) {Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White}
+
+                    if ($resp.data)
+                    {
+                        $script:SourceObjectCache[$extId] = $resp.data
+                        $result = $resp.data
+                    }
+                }
+                catch {
+                    $saved_error = $_.Exception.Message
+                    $error_code = ($saved_error -split " ")[3]
+                    if ($error_code -eq "404")
+                    {
+                        Write-Host "$(get-date) [WARNING] The category extId specified ($extId) does not exist in Prism Central $pc" -ForegroundColor Yellow
+                    }
+                    else
+                    {
+                        Write-Host "$saved_error" -ForegroundColor Yellow
+                    }
+                }
+                finally {
+                    #add any last words here; this gets processed no matter what
+                }
             }
         }
 
         end
         {
-            return $category_value_pair
+            return $result
         }
     }
 
@@ -959,7 +1549,7 @@ public static void Ignore()
     }
 
     function Get-VpcByExtId
-    {#retrieves vpc object v4
+    {#retrieves vpc object v4. Returns the VPC data (name, extId) and caches it for the run.
         [CmdletBinding()]
         param
         (
@@ -969,39 +1559,1109 @@ public static void Ignore()
 
         begin
         {
+            if (-not $script:SourceObjectCache) { $script:SourceObjectCache = @{} }
+            $result = $null
             $url = "https://{0}:9440/api/networking/v4.0/config/vpcs/{1}" -f $pc,$extId
             $method = "GET"
         }
 
         process
         {
-            try {
-                $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                if ($debugme) {Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White}
-
-                $vpc_name = "$($resp.data.name)"
+            if ($script:MissingSourceExtIds -and $script:MissingSourceExtIds.ContainsKey($extId))
+            {
+                $result = $null
             }
-            catch {
-                $saved_error = $_.Exception.Message
-                $error_code = ($saved_error -split " ")[3]
-                if ($error_code -eq "404")
-                {
-                    Write-Host "$(get-date) [WARNING] The vpc extId specified ($extId) does not exist in Prism Central $pc" -ForegroundColor Yellow
-                }
-                else
-                {
-                    Write-Host "$saved_error" -ForegroundColor Yellow
-                }
+            elseif ($script:SourceObjectCache.ContainsKey($extId))
+            {
+                $result = $script:SourceObjectCache[$extId]
             }
-            finally {
-                #add any last words here; this gets processed no matter what
+            else
+            {
+                try {
+                    $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
+
+                    if ($debugme) {Write-Host "$(Get-Date) [DEBUG] Response Metadata: $($resp.metadata | ConvertTo-Json)" -ForegroundColor White}
+
+                    if ($resp.data)
+                    {
+                        $script:SourceObjectCache[$extId] = $resp.data
+                        $result = $resp.data
+                    }
+                }
+                catch {
+                    $saved_error = $_.Exception.Message
+                    $error_code = ($saved_error -split " ")[3]
+                    if ($error_code -eq "404")
+                    {
+                        Write-Host "$(get-date) [WARNING] The vpc extId specified ($extId) does not exist in Prism Central $pc" -ForegroundColor Yellow
+                    }
+                    else
+                    {
+                        Write-Host "$saved_error" -ForegroundColor Yellow
+                    }
+                }
+                finally {
+                    #add any last words here; this gets processed no matter what
+                }
             }
         }
 
         end
         {
-            return $vpc_name
+            return $result
+        }
+    }
+
+    #PowerShell 7 throws "Argument types do not match" when @() wraps List[object].
+    function Get-EnumeratedItems
+    {
+        param($Value)
+
+        if ($null -eq $Value) { return }
+        if ($Value -is [System.Collections.Generic.List[object]])
+        {
+            foreach ($item in $Value.ToArray()) { Write-Output $item }
+            return
+        }
+        if ($Value -is [string])
+        {
+            Write-Output $Value
+            return
+        }
+        foreach ($item in @($Value)) { Write-Output $item }
+    }
+
+    function New-NameIndex
+    {
+        param($Items)
+
+        $index = @{}
+        foreach ($item in (Get-EnumeratedItems $Items))
+        {
+            if ($null -eq $item) { continue }
+            $name = [string]$item.name
+            if ([string]::IsNullOrEmpty($name)) { continue }
+            if (-not $index.ContainsKey($name))
+            {
+                $index[$name] = $item
+            }
+        }
+        return $index
+    }
+
+    function Add-CategoryToIndex
+    {
+        param($Index, $Key, $Value, $ExtId)
+
+        $keyName = [string]$Key
+        $valueName = [string]$Value
+        if ([string]::IsNullOrEmpty($keyName)) { return }
+        if (-not $Index.ContainsKey($keyName))
+        {
+            $Index[$keyName] = @{}
+        }
+        if (-not $Index[$keyName].ContainsKey($valueName))
+        {
+            $Index[$keyName][$valueName] = [string]$ExtId
+        }
+    }
+
+    function New-CategoryIndex
+    {
+        param($Categories)
+
+        $index = @{}
+        foreach ($category in (Get-EnumeratedItems $Categories))
+        {
+            if ($null -eq $category) { continue }
+            Add-CategoryToIndex -Index $index -Key $category.key -Value $category.value -ExtId $category.extId
+        }
+        return $index
+    }
+
+    function Get-CachedSourceObject
+    {
+        param
+        (
+            [Parameter(Mandatory = $true)][string] $extId,
+            [Parameter(Mandatory = $true)][string] $url
+        )
+
+        if (-not $script:SourceObjectCache) { $script:SourceObjectCache = @{} }
+        if ($script:MissingSourceExtIds -and $script:MissingSourceExtIds.ContainsKey($extId)) { return $null }
+        if ($script:SourceObjectCache.ContainsKey($extId))
+        {
+            return $script:SourceObjectCache[$extId]
+        }
+
+        $resp = Invoke-RateLimitedApiCall -method GET -url $url -credential $prismCredentials
+        if ($resp.data)
+        {
+            $script:SourceObjectCache[$extId] = $resp.data
+        }
+        return $resp.data
+    }
+
+    #Replaces source extIds using the run map. A single JSON string stays a string; an array stays an array.
+    function Update-ReferenceProperty
+    {
+        param
+        (
+            $Object,
+            [Parameter(Mandatory = $true)][string] $PropertyName,
+            $Map
+        )
+
+        if ($null -eq $Object -or $null -eq $Map -or $Map.Count -eq 0) { return }
+        if ($Object.PSObject.Properties.Name -notcontains $PropertyName) { return }
+
+        $value = $Object.$PropertyName
+        if ($null -eq $value) { return }
+
+        $wasScalar = $value -is [string]
+        $items = @($value)
+        $changed = $false
+        for ($i = 0; $i -lt $items.Count; $i++)
+        {
+            if ($null -eq $items[$i]) { continue }
+            $key = [string]$items[$i]
+            if ($Map.ContainsKey($key))
+            {
+                $items[$i] = $Map[$key]
+                $changed = $true
+            }
+        }
+        if (-not $changed) { return }
+        if ($wasScalar)
+        {
+            $Object.$PropertyName = $items[0]
+        }
+        else
+        {
+            $Object.$PropertyName = $items
+        }
+    }
+
+    function Update-PolicyRuleReferences
+    {
+        param
+        (
+            $Policy,
+            [string[]] $PropertyNames,
+            [switch] $IncludeIsolationGroups
+        )
+
+        if (-not $script:ExtIdMap -or $script:ExtIdMap.Count -eq 0) { return }
+        if (-not $Policy.data.rules) { return }
+
+        foreach ($rule in @($Policy.data.rules))
+        {
+            if (-not $rule.spec) { continue }
+            foreach ($propertyName in $PropertyNames)
+            {
+                Update-ReferenceProperty -Object $rule.spec -PropertyName $propertyName -Map $script:ExtIdMap
+            }
+            if ($IncludeIsolationGroups -and $rule.spec.spec -and $rule.spec.spec.isolationGroups)
+            {
+                foreach ($group in @($rule.spec.spec.isolationGroups))
+                {
+                    Update-ReferenceProperty -Object $group -PropertyName "groupCategoryReferences" -Map $script:ExtIdMap
+                }
+            }
+        }
+    }
+
+    function Get-CreatedExtId
+    {
+        param
+        (
+            $Response,
+            [Parameter(Mandatory = $true)][string] $LookupUrl
+        )
+
+        $created = $null
+        $objectType = ""
+        if ($Response -and $Response.data)
+        {
+            $objectType = [string]$Response.data.'$objectType'
+            $created = $Response.data.extId
+            if ($created -is [System.Array]) { $created = $created[0] }
+        }
+
+        # A task reference is not the new entity. Look the entity up by the escaped name filter.
+        if ($created -and $objectType -notmatch 'Task')
+        {
+            return [string]$created
+        }
+
+        $lookup = Invoke-RateLimitedApiCall -method GET -url $LookupUrl -credential $prismCredentials
+        $match = @($lookup.data) | Where-Object { $_ -and $_.extId } | Select-Object -First 1
+        if ($match.extId)
+        {
+            return [string]$match.extId
+        }
+        Throw "$(Get-Date) [ERROR] Create succeeded but no extId was returned from $LookupUrl"
+    }
+
+    function Add-ReferenceId
+    {
+        param($Set, $Values)
+        foreach ($value in @($Values))
+        {
+            if ($value) { $Set[[string]$value] = $true }
+        }
+    }
+
+    function Import-ReferencedSourceObjects
+    {
+        param([Parameter(Mandatory)] $Policies)
+
+        if (-not $script:SourceObjectCache) { $script:SourceObjectCache = @{} }
+        if (-not $script:MissingSourceExtIds) { $script:MissingSourceExtIds = @{} }
+        $categories = @{}
+        $addressGroups = @{}
+        $serviceGroups = @{}
+        $vpcs = @{}
+        foreach ($policy in (Get-EnumeratedItems $Policies))
+        {
+            if (-not $policy -or -not $policy.data -or $policy.data.scope -eq 'ALL_VLAN') { continue }
+            $includeVpc = $policy.data.scope -ne 'GLOBAL'
+            if ($policy.data.type -eq 'ISOLATION')
+            {
+                if ($includeVpc) { Add-ReferenceId -Set $vpcs -Values $policy.data.vpcReferences }
+                foreach ($rule in @($policy.data.rules))
+                {
+                    if (-not $rule.spec) { continue }
+                    Add-ReferenceId -Set $categories -Values $rule.spec.firstIsolationGroup
+                    Add-ReferenceId -Set $categories -Values $rule.spec.secondIsolationGroup
+                    if ($rule.spec.spec -and $rule.spec.spec.isolationGroups)
+                    {
+                        foreach ($group in @($rule.spec.spec.isolationGroups))
+                        {
+                            Add-ReferenceId -Set $categories -Values $group.groupCategoryReferences
+                        }
+                    }
+                }
+            }
+            elseif ($policy.data.type -eq 'APPLICATION')
+            {
+                if ($includeVpc) { Add-ReferenceId -Set $vpcs -Values $policy.data.vpcReferences }
+                foreach ($rule in @($policy.data.rules))
+                {
+                    if (-not $rule.spec) { continue }
+                    Add-ReferenceId -Set $categories -Values $rule.spec.securedGroupCategoryReferences
+                    Add-ReferenceId -Set $categories -Values $rule.spec.srcCategoryReferences
+                    Add-ReferenceId -Set $categories -Values $rule.spec.destCategoryReferences
+                    Add-ReferenceId -Set $addressGroups -Values $rule.spec.srcAddressGroupReferences
+                    Add-ReferenceId -Set $addressGroups -Values $rule.spec.destAddressGroupReferences
+                    Add-ReferenceId -Set $serviceGroups -Values $rule.spec.serviceGroupReferences
+                }
+            }
+        }
+
+        $requests = New-Object System.Collections.Generic.List[object]
+        foreach ($extId in @($categories.Keys))
+        {
+            if ($script:SourceObjectCache.ContainsKey($extId) -or $script:MissingSourceExtIds.ContainsKey($extId)) { continue }
+            $requests.Add([pscustomobject]@{ Id = "category|$extId"; Method = 'GET'; Url = "https://$sourcePc`:9440/api/prism/v4.0.a2/config/categories/$extId" })
+        }
+        foreach ($extId in @($addressGroups.Keys))
+        {
+            if ($script:SourceObjectCache.ContainsKey($extId) -or $script:MissingSourceExtIds.ContainsKey($extId)) { continue }
+            $requests.Add([pscustomobject]@{ Id = "address|$extId"; Method = 'GET'; Url = "https://$sourcePc`:9440/api/microseg/v4.0/config/address-groups/$extId" })
+        }
+        foreach ($extId in @($serviceGroups.Keys))
+        {
+            if ($script:SourceObjectCache.ContainsKey($extId) -or $script:MissingSourceExtIds.ContainsKey($extId)) { continue }
+            $requests.Add([pscustomobject]@{ Id = "service|$extId"; Method = 'GET'; Url = "https://$sourcePc`:9440/api/microseg/v4.0/config/service-groups/$extId" })
+        }
+        foreach ($extId in @($vpcs.Keys))
+        {
+            if ($script:SourceObjectCache.ContainsKey($extId) -or $script:MissingSourceExtIds.ContainsKey($extId)) { continue }
+            $requests.Add([pscustomobject]@{ Id = "vpc|$extId"; Method = 'GET'; Url = "https://$sourcePc`:9440/api/networking/v4.0/config/vpcs/$extId" })
+        }
+        if ($requests.Count -eq 0) { return }
+
+        Write-Host "$(Get-Date) [INFO] Retrieving $($requests.Count) referenced source objects..." -ForegroundColor Green
+        foreach ($result in @(Invoke-PrismRequestBatch -Requests $requests -BatchErrorAction Continue))
+        {
+            $extId = ($result.Id -split '\|', 2)[1]
+            if ($result.Ok -and $result.Body.data)
+            {
+                $script:SourceObjectCache[$extId] = $result.Body.data
+            }
+            elseif ($result.Error -match '404')
+            {
+                $script:MissingSourceExtIds[$extId] = $true
+                Write-Host "$(Get-Date) [WARNING] Source object $extId was not found on $sourcePc" -ForegroundColor Yellow
+            }
+            else
+            {
+                Throw "$(Get-Date) [ERROR] Failed to read source object $($result.Id): $($result.Error)"
+            }
+        }
+    }
+
+    function Add-PendingRename
+    {
+        param($Kind, $Source, $Target, $TargetByName, $NewName, $Url)
+        if (-not $script:PendingRenames) { $script:PendingRenames = @{} }
+        $key = [string]$Target.extId
+        if ([string]::IsNullOrEmpty($key) -or $script:PendingRenames.ContainsKey($key)) { return }
+        $script:PendingRenames[$key] = [pscustomobject]@{
+            Kind = $Kind
+            Source = $Source
+            Target = $Target
+            TargetByName = $TargetByName
+            NewName = $NewName
+            OldName = [string]$Source.name
+            Url = $Url
+        }
+    }
+
+    function Complete-PendingRenames
+    {
+        if (-not $script:PendingRenames -or $script:PendingRenames.Count -eq 0) { return }
+        $entries = @($script:PendingRenames.Values)
+        $etagRequests = New-Object System.Collections.Generic.List[object]
+        foreach ($entry in $entries)
+        {
+            $etagRequests.Add([pscustomobject]@{ Id = [string]$entry.Target.extId; Method = 'GET'; Url = $entry.Url; ReturnETag = $true })
+        }
+        $etags = @{}
+        foreach ($result in @(Invoke-PrismRequestBatch -Requests $etagRequests))
+        {
+            if (-not $result.Ok) { Throw "$(Get-Date) [ERROR] Failed to read ETag for $($result.Id): $($result.Error)" }
+            $etags[$result.Id] = [string]$result.Body
+        }
+
+        $putRequests = New-Object System.Collections.Generic.List[object]
+        foreach ($entry in $entries)
+        {
+            $content = @{
+                description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                name = $entry.NewName
+            }
+            if ($entry.Kind -eq 'AddressGroup')
+            {
+                if ($entry.Source.ipv4Addresses) { $content.Add('ipv4Addresses', $entry.Source.ipv4Addresses) }
+                if ($entry.Source.ipRanges) { $content.Add('ipRanges', $entry.Source.ipRanges) }
+            }
+            else
+            {
+                if ($entry.Source.tcpServices) { $content.Add('tcpServices', $entry.Source.tcpServices) }
+                if ($entry.Source.udpServices) { $content.Add('udpServices', $entry.Source.udpServices) }
+                if ($entry.Source.icmpServices) { $content.Add('icmpServices', $entry.Source.icmpServices) }
+            }
+            $putRequests.Add([pscustomobject]@{
+                Id = [string]$entry.Target.extId
+                Method = 'PUT'
+                Url = $entry.Url
+                Payload = (ConvertTo-Json $content -Depth 10)
+                NtnxReqId = [string](New-Guid)
+                IfMatch = $etags[[string]$entry.Target.extId]
+            })
+            Write-Host "$(Get-Date) [INFO] Updating $($entry.Kind) $($entry.OldName) to $targetPc with name $($entry.NewName)" -ForegroundColor Green
+        }
+        foreach ($result in @(Invoke-PrismRequestBatch -Requests $putRequests))
+        {
+            if (-not $result.Ok) { Throw "$(Get-Date) [ERROR] Failed to rename $($result.Id): $($result.Error)" }
+            $entry = $script:PendingRenames[$result.Id]
+            Write-Host "$(Get-Date) [SUCCESS] Updated $($entry.Kind) $($entry.OldName) to $targetPc with name $($entry.NewName)" -ForegroundColor Cyan
+            if ($entry.TargetByName.ContainsKey($entry.OldName)) { $entry.TargetByName.Remove($entry.OldName) }
+            $entry.TargetByName[$entry.NewName] = $entry.Target
+        }
+        $script:PendingRenames = @{}
+    }
+
+    function Import-ListedSourceObjects
+    {
+        param($Items)
+
+        if (-not $script:SourceObjectCache) { $script:SourceObjectCache = @{} }
+        if (-not $script:SourceCategoryIndex) { $script:SourceCategoryIndex = @{} }
+        foreach ($item in (Get-EnumeratedItems $Items))
+        {
+            if (-not $item -or -not $item.extId) { continue }
+            $script:SourceObjectCache[[string]$item.extId] = $item
+            if ($item.key -and $null -ne $item.value)
+            {
+                Add-CategoryToIndex -Index $script:SourceCategoryIndex -Key $item.key -Value $item.value -ExtId $item.extId
+            }
+        }
+    }
+
+    function Get-ResponseEntityExtId
+    {
+        param($Response)
+
+        if (-not $Response -or -not $Response.data) { return $null }
+        $objectType = [string]$Response.data.'$objectType'
+        $created = $Response.data.extId
+        if ($created -is [System.Array]) { $created = $created[0] }
+        if ($created -and $objectType -notmatch 'Task') { return [string]$created }
+        return $null
+    }
+
+    function Register-CreatedExtId
+    {
+        param($SourceExtId, $TargetExtId, $Kind, $Source, $ObjectName)
+
+        if (-not $script:ExtIdMap) { $script:ExtIdMap = @{} }
+        $script:ExtIdMap[[string]$SourceExtId] = [string]$TargetExtId
+        if ($script:AwaitingCreateExtId) { [void]$script:AwaitingCreateExtId.Remove([string]$SourceExtId) }
+        if ($Kind -eq 'Category')
+        {
+            if (-not $script:TargetCategoryIndex) { $script:TargetCategoryIndex = @{} }
+            Add-CategoryToIndex -Index $script:TargetCategoryIndex -Key $Source.key -Value $Source.value -ExtId $TargetExtId
+        }
+        else
+        {
+            $index = if ($Kind -eq 'AddressGroup') { $script:TargetAddressGroupByName } else { $script:TargetServiceGroupByName }
+            $name = [string]$ObjectName
+            if ($index -and -not [string]::IsNullOrEmpty($name) -and -not $index.ContainsKey($name))
+            {
+                $index[$name] = [pscustomobject]@{ name = $name; extId = [string]$TargetExtId }
+            }
+        }
+    }
+
+    function Add-GroupCreateRequest
+    {
+        param($Requests, $Kind, $Source)
+
+        $endpoint = if ($Kind -eq 'AddressGroup') { 'address-groups' } else { 'service-groups' }
+        $objectName = [string]$Source.name
+        if ($rename) { $objectName = $rename + "_" + $Source.name }
+        $id = [string]$Source.extId
+        $script:AwaitingCreateExtId[$id] = $true
+        $script:PostedCreates[$id] = [pscustomobject]@{ Kind = $Kind; Source = $Source; ObjectName = $objectName }
+        $content = @{
+            description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+            name = $objectName
+        }
+        if ($Kind -eq 'AddressGroup')
+        {
+            if ($Source.ipv4Addresses) { $content.Add('ipv4Addresses', $Source.ipv4Addresses) }
+            if ($Source.ipRanges) { $content.Add('ipRanges', $Source.ipRanges) }
+        }
+        else
+        {
+            if ($Source.tcpServices) { $content.Add('tcpServices', $Source.tcpServices) }
+            if ($Source.udpServices) { $content.Add('udpServices', $Source.udpServices) }
+            if ($Source.icmpServices) { $content.Add('icmpServices', $Source.icmpServices) }
+        }
+        $Requests.Add([pscustomobject]@{
+            Id = $id
+            Method = 'POST'
+            Url = "https://$targetPc`:9440/api/microseg/v4.0/config/$endpoint"
+            Payload = (ConvertTo-Json $content -Depth 10)
+            NtnxReqId = [string](New-Guid)
+        })
+    }
+
+    function Get-PendingCreateRequests
+    {
+        param([ValidateSet('All','Category','AddressGroup','ServiceGroup')][string] $Kind = 'All')
+
+        if (-not $script:PostedCreates) { $script:PostedCreates = @{} }
+        if (-not $script:AwaitingCreateExtId) { $script:AwaitingCreateExtId = @{} }
+        $requests = New-Object System.Collections.Generic.List[object]
+        if (($Kind -eq 'All' -or $Kind -eq 'Category') -and $script:PendingCategoryIds)
+        {
+            foreach ($sourceCategory in @($script:PendingCategoryIds.Values))
+            {
+                if (-not $sourceCategory) { continue }
+                $id = [string]$sourceCategory.extId
+                if ([string]::IsNullOrEmpty($id)) { continue }
+                if ($script:PostedCreates.ContainsKey($id) -or ($script:ExtIdMap -and $script:ExtIdMap.ContainsKey($id))) { continue }
+                $script:AwaitingCreateExtId[$id] = $true
+                $objectName = "$($sourceCategory.key):$($sourceCategory.value)"
+                $script:PostedCreates[$id] = [pscustomobject]@{ Kind = 'Category'; Source = $sourceCategory; ObjectName = $objectName }
+                $content = @{
+                    key = $sourceCategory.key
+                    description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                    value = [string]$sourceCategory.value
+                }
+                $requests.Add([pscustomobject]@{
+                    Id = $id
+                    Method = 'POST'
+                    Url = "https://$targetPc`:9440/api/prism/v4.0.a2/config/categories"
+                    Payload = (ConvertTo-Json $content -Depth 4)
+                })
+            }
+            $script:PendingCategoryIds = @{}
+        }
+        if (($Kind -eq 'All' -or $Kind -eq 'AddressGroup') -and $script:PendingAddressGroups)
+        {
+            foreach ($source in @($script:PendingAddressGroups.Values))
+            {
+                if (-not $source) { continue }
+                $id = [string]$source.extId
+                if ([string]::IsNullOrEmpty($id)) { continue }
+                if ($script:PostedCreates.ContainsKey($id) -or ($script:ExtIdMap -and $script:ExtIdMap.ContainsKey($id))) { continue }
+                Add-GroupCreateRequest -Requests $requests -Kind 'AddressGroup' -Source $source
+            }
+            $script:PendingAddressGroups = @{}
+        }
+        if (($Kind -eq 'All' -or $Kind -eq 'ServiceGroup') -and $script:PendingServiceGroups)
+        {
+            foreach ($source in @($script:PendingServiceGroups.Values))
+            {
+                if (-not $source) { continue }
+                $id = [string]$source.extId
+                if ([string]::IsNullOrEmpty($id)) { continue }
+                if ($script:PostedCreates.ContainsKey($id) -or ($script:ExtIdMap -and $script:ExtIdMap.ContainsKey($id))) { continue }
+                Add-GroupCreateRequest -Requests $requests -Kind 'ServiceGroup' -Source $source
+            }
+            $script:PendingServiceGroups = @{}
+        }
+        return ,$requests
+    }
+
+    function Register-CreateResult
+    {
+        param($Result)
+
+        $posted = $null
+        if ($script:PostedCreates) { $posted = $script:PostedCreates[[string]$Result.Id] }
+        if (-not $posted) { Throw "$(Get-Date) [ERROR] Unexpected create result $($Result.Id)" }
+        if (-not $Result.Ok) { Throw "$(Get-Date) [ERROR] Failed to add $($posted.Kind) $($posted.ObjectName): $($Result.Error)" }
+        $targetExtId = Get-ResponseEntityExtId -Response $Result.Body
+        if ($targetExtId)
+        {
+            Register-CreatedExtId -SourceExtId $Result.Id -TargetExtId $targetExtId -Kind $posted.Kind -Source $posted.Source -ObjectName $posted.ObjectName
+            [void]$script:PostedCreates.Remove([string]$Result.Id)
+            Write-CreateProgress -Message "Added $($posted.Kind) $($posted.ObjectName) in $targetPc" -Level SUCCESS
+            return
+        }
+        if (-not $script:UnresolvedCreates) { $script:UnresolvedCreates = @{} }
+        $script:UnresolvedCreates[[string]$Result.Id] = $posted
+        Write-CreateProgress -Message "Create of $($posted.Kind) $($posted.ObjectName) returned no entity extId. It will be matched from the target list." -Level WARNING
+    }
+
+    function Write-CreateProgress
+    {
+        param([string] $Message, [ValidateSet('SUCCESS','WARNING','INFO')][string] $Level = 'INFO')
+
+        if (-not $script:CreateProgressDone) { $script:CreateProgressDone = 0 }
+        $script:CreateProgressDone++
+        $suffix = ''
+        if ($script:CreateProgressTotal -gt 1)
+        {
+            $suffix = " ($($script:CreateProgressDone) of $($script:CreateProgressTotal))"
+        }
+        $color = switch ($Level) { 'SUCCESS' { 'Cyan' } 'WARNING' { 'Yellow' } default { 'Green' } }
+        Write-Host "$(Get-Date) [$Level] $Message$suffix" -ForegroundColor $color
+    }
+
+    function Resolve-UnmappedCreates
+    {
+        if (-not $script:UnresolvedCreates -or $script:UnresolvedCreates.Count -eq 0) { return }
+        $needCategory = $false
+        $needAddress = $false
+        $needService = $false
+        foreach ($posted in @($script:UnresolvedCreates.Values))
+        {
+            if ($posted.Kind -eq 'Category') { $needCategory = $true }
+            elseif ($posted.Kind -eq 'AddressGroup') { $needAddress = $true }
+            elseif ($posted.Kind -eq 'ServiceGroup') { $needService = $true }
+        }
+        $catalogs = @()
+        if ($needCategory) { $catalogs += @{ Key = 'categories'; Pc = $targetPc; ApiPath = 'api/prism/v4.0.a2/config/categories' } }
+        if ($needAddress) { $catalogs += @{ Key = 'address groups'; Pc = $targetPc; Object = 'address-groups' } }
+        if ($needService) { $catalogs += @{ Key = 'service groups'; Pc = $targetPc; Object = 'service-groups' } }
+        Write-Host "$(Get-Date) [STEP] Matching created Flow objects on $targetPc" -ForegroundColor Magenta
+        $matchTotal = $script:UnresolvedCreates.Count
+        $matchDone = 0
+        $fetched = Get-PrismCatalogs -Catalogs $catalogs
+        $categoryIndex = $null
+        $addressIndex = $null
+        $serviceIndex = $null
+        if ($needCategory) { $categoryIndex = New-CategoryIndex $fetched.Catalogs['categories'] }
+        if ($needAddress) { $addressIndex = New-NameIndex $fetched.Catalogs['address groups'] }
+        if ($needService) { $serviceIndex = New-NameIndex $fetched.Catalogs['service groups'] }
+        foreach ($id in @($script:UnresolvedCreates.Keys))
+        {
+            $posted = $script:UnresolvedCreates[$id]
+            $targetExtId = $null
+            if ($posted.Kind -eq 'Category')
+            {
+                $key = [string]$posted.Source.key
+                $value = [string]$posted.Source.value
+                if ($categoryIndex.ContainsKey($key) -and $categoryIndex[$key].ContainsKey($value))
+                {
+                    $targetExtId = [string]$categoryIndex[$key][$value]
+                }
+            }
+            elseif ($posted.Kind -eq 'AddressGroup')
+            {
+                if ($addressIndex.ContainsKey([string]$posted.ObjectName)) { $targetExtId = [string]$addressIndex[[string]$posted.ObjectName].extId }
+            }
+            elseif ($serviceIndex.ContainsKey([string]$posted.ObjectName))
+            {
+                $targetExtId = [string]$serviceIndex[[string]$posted.ObjectName].extId
+            }
+            if ([string]::IsNullOrEmpty($targetExtId))
+            {
+                Throw "$(Get-Date) [ERROR] Create of $($posted.Kind) $($posted.ObjectName) did not appear on $targetPc"
+            }
+            Register-CreatedExtId -SourceExtId $id -TargetExtId $targetExtId -Kind $posted.Kind -Source $posted.Source -ObjectName $posted.ObjectName
+            [void]$script:UnresolvedCreates.Remove($id)
+            if ($script:PostedCreates) { [void]$script:PostedCreates.Remove($id) }
+            $matchDone++
+            Write-Host "$(Get-Date) [SUCCESS] Added $($posted.Kind) $($posted.ObjectName) in $targetPc ($matchDone of $matchTotal)" -ForegroundColor Cyan
+        }
+    }
+
+    function Invoke-PendingCreates
+    {
+        param([ValidateSet('All','Category','AddressGroup','ServiceGroup')][string] $Kind = 'All')
+
+        $requests = Get-PendingCreateRequests -Kind $Kind
+        if ($requests.Count -eq 0) { return }
+        $script:CreateProgressDone = 0
+        $script:CreateProgressTotal = $requests.Count
+        Invoke-PrismRequestBatch -Requests $requests -OnResult ${function:Register-CreateResult} | Out-Null
+    }
+
+    function Complete-PendingCategoryCreates
+    {
+        Invoke-PendingCreates -Kind Category
+        Resolve-UnmappedCreates
+    }
+
+    function Complete-PendingGroupCreates
+    {
+        param([Parameter(Mandatory)][ValidateSet('AddressGroup','ServiceGroup')][string] $Kind)
+        Invoke-PendingCreates -Kind $Kind
+        Resolve-UnmappedCreates
+    }
+
+    function Add-SyncedPolicyWork
+    {
+        param
+        (
+            $Nsp,
+            [ValidateSet('add','update')][string] $Action,
+            $PolicyByExtId,
+            $AddWork,
+            $UpdateWork
+        )
+
+        if (-not $Nsp) { return $null }
+        $policy = $null
+        if ($PolicyByExtId) { $policy = $PolicyByExtId[[string]$Nsp.extId] }
+        if (-not $policy) { return $null }
+        if ($policy.data.scope -eq 'ALL_VLAN')
+        {
+            Write-Host "$(Get-Date) [WARNING] Not Syncing policy $($policy.data.name) as it is a VLAN policy" -ForegroundColor Cyan
+            return $null
+        }
+        $work = [pscustomobject]@{ Nsp = $Nsp; Policy = $policy }
+        if ($Action -eq 'add') { $AddWork.Add($work) } else { $UpdateWork.Add($work) }
+        return $work
+    }
+
+    function Sync-PolicyReferences
+    {
+        param
+        (
+            $WorkItems,
+            [ValidateSet('Map','Rewrite')][string] $Phase,
+            $TargetVpcByName,
+            $TargetCategoryIndex,
+            $TargetSgByName,
+            $TargetAgByName
+        )
+
+        foreach ($work in (Get-EnumeratedItems $WorkItems))
+        {
+            if (-not $work) { continue }
+            $policy = $work.Policy
+            if ($policy.data.scope -ne 'GLOBAL')
+            {
+                Sync-Vpc -policy $policy -TargetVpcByName $TargetVpcByName -Phase $Phase
+            }
+            Sync-Categories -policy $policy -TargetCategoryIndex $TargetCategoryIndex -Phase $Phase
+            Sync-ServiceGroups -policy $policy -TargetByName $TargetSgByName -Phase $Phase
+            Sync-AddressGroups -policy $policy -TargetByName $TargetAgByName -Phase $Phase
+        }
+    }
+
+    function Get-SortedIdList
+    {
+        param($Value)
+
+        $ids = New-Object System.Collections.Generic.List[string]
+        foreach ($item in (Get-EnumeratedItems $Value))
+        {
+            if ($null -eq $item) { continue }
+            $id = [string]$item
+            if (-not [string]::IsNullOrEmpty($id)) { $ids.Add($id) }
+        }
+        $sorted = $ids.ToArray()
+        [Array]::Sort($sorted)
+        return ,$sorted
+    }
+
+    #Categories have a key and a value. Address groups, service groups, and VPCs have a name.
+    function Get-CatalogObjectLabel
+    {
+        param($ExtId, $Catalog, [switch] $StripRenamePrefix)
+
+        $id = [string]$ExtId
+        if ([string]::IsNullOrEmpty($id)) { return $null }
+        $item = $null
+        if ($Catalog -and $Catalog.ContainsKey($id)) { $item = $Catalog[$id] }
+        if ($item -and $item.key -and $null -ne $item.value) { return "{0}:{1}" -f $item.key, $item.value }
+        if ($item -and -not [string]::IsNullOrEmpty([string]$item.name))
+        {
+            $label = [string]$item.name
+            $prefix = if ($StripRenamePrefix -and $rename) { "$rename`_" } else { "" }
+            if (-not [string]::IsNullOrEmpty($prefix) -and $label.StartsWith($prefix)) { $label = $label.Substring($prefix.Length) }
+            return $label
+        }
+        return "unresolved:$id"
+    }
+
+    #Builds the value compared between a source GET and a target GET.
+    #Identity fields are removed. Reference extIds become catalog names. Every list is ordered by its contents.
+    function ConvertTo-ComparableNode
+    {
+        param($Value, $Catalog, [switch] $StripRenamePrefix)
+
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [string] -or $Value -is [System.ValueType]) { return $Value }
+
+        $dropNames = @{
+            extId = $true
+            '$objectType' = $true
+            '$reserved' = $true
+            '$unknownFields' = $true
+            metadata = $true
+            links = $true
+            tenantId = $true
+            creationTime = $true
+            lastUpdateTime = $true
+            createdBy = $true
+            projectExtId = $true
+        }
+        $referenceNames = @{
+            vpcReferences = $true
+            securedGroupCategoryReferences = $true
+            srcCategoryReferences = $true
+            destCategoryReferences = $true
+            srcAddressGroupReferences = $true
+            destAddressGroupReferences = $true
+            serviceGroupReferences = $true
+            firstIsolationGroup = $true
+            secondIsolationGroup = $true
+            groupCategoryReferences = $true
+        }
+
+        if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject])
+        {
+            $names = if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+            $result = [ordered]@{}
+            foreach ($name in ($names | Sort-Object))
+            {
+                $propertyName = [string]$name
+                if ($dropNames.ContainsKey($propertyName)) { continue }
+                $child = $Value.$propertyName
+                if ($null -eq $child) { continue }
+                if ($referenceNames.ContainsKey($propertyName))
+                {
+                    $labels = New-Object System.Collections.Generic.List[string]
+                    foreach ($extId in (Get-EnumeratedItems $child))
+                    {
+                        $label = Get-CatalogObjectLabel -ExtId $extId -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+                        if ($label) { $labels.Add($label) }
+                    }
+                    $sortedLabels = @($labels | Sort-Object)
+                    $result[$propertyName] = $sortedLabels
+                }
+                else
+                {
+                    $converted = ConvertTo-ComparableNode -Value $child -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+                    if ($null -ne $converted) { $result[$propertyName] = $converted }
+                }
+            }
+            return $result
+        }
+
+        $items = New-Object System.Collections.Generic.List[object]
+        foreach ($item in (Get-EnumeratedItems $Value))
+        {
+            if ($null -eq $item) { continue }
+            $items.Add((ConvertTo-ComparableNode -Value $item -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix))
+        }
+        $sorted = @($items | Sort-Object { Get-ComparableSignature $_ })
+        return ,$sorted
+    }
+
+    function Get-ComparableSignature
+    {
+        param($Node)
+
+        if ($null -eq $Node) { return '<null>' }
+        if ($Node -is [string] -or $Node -is [System.ValueType]) { return (ConvertTo-Json $Node -Compress) }
+        return (ConvertTo-Json $Node -Depth 100 -Compress)
+    }
+
+    function Get-ComparableLabel
+    {
+        param($Node)
+
+        if ($null -eq $Node) { return '<null>' }
+        if ($Node -is [string] -or $Node -is [System.ValueType]) { return [string]$Node }
+        if ($Node -is [System.Collections.IDictionary])
+        {
+            if ($Node.Contains('type') -and $Node.Contains('description')) { return "{0} '{1}'" -f $Node['type'], $Node['description'] }
+            if ($Node.Contains('description')) { return "'{0}'" -f $Node['description'] }
+            if ($Node.Contains('startPort') -or $Node.Contains('endPort')) { return "ports $($Node['startPort'])-$($Node['endPort'])" }
+            if ($Node.Contains('type')) { return [string]$Node['type'] }
+        }
+        $signature = Get-ComparableSignature $Node
+        if ($signature.Length -gt 80) { return $signature.Substring(0, 80) }
+        return $signature
+    }
+
+    function ConvertTo-ComparablePolicy
+    {
+        param($Policy, $Catalog, [switch] $StripRenamePrefix)
+
+        $data = $Policy
+        if ($Policy -and $Policy.data) { $data = $Policy.data }
+        $node = ConvertTo-ComparableNode -Value $data -Catalog $Catalog -StripRenamePrefix:$StripRenamePrefix
+        if ($null -eq $node) { $node = [ordered]@{} }
+        #The sync writes its own policy description, so that field cannot decide an update.
+        if ($node.Contains('description')) { [void]$node.Remove('description') }
+        if ($StripRenamePrefix -and $rename -and $node.Contains('name'))
+        {
+            $prefix = "$rename`_"
+            $policyName = [string]$node['name']
+            if ($policyName.StartsWith($prefix)) { $node['name'] = $policyName.Substring($prefix.Length) }
+        }
+        return $node
+    }
+
+    function Add-ListDifference
+    {
+        param($Left, $Right, [string] $Prefix, $Paths)
+
+        $leftBySignature = @{}
+        foreach ($item in (Get-EnumeratedItems $Left))
+        {
+            $signature = Get-ComparableSignature $item
+            if (-not $leftBySignature.ContainsKey($signature)) { $leftBySignature[$signature] = New-Object System.Collections.Generic.List[object] }
+            $leftBySignature[$signature].Add($item)
+        }
+        $rightBySignature = @{}
+        foreach ($item in (Get-EnumeratedItems $Right))
+        {
+            $signature = Get-ComparableSignature $item
+            if (-not $rightBySignature.ContainsKey($signature)) { $rightBySignature[$signature] = New-Object System.Collections.Generic.List[object] }
+            $rightBySignature[$signature].Add($item)
+        }
+
+        $leftOnly = New-Object System.Collections.Generic.List[object]
+        $rightOnly = New-Object System.Collections.Generic.List[object]
+        $signatures = New-Object System.Collections.Generic.List[string]
+        foreach ($signature in @($leftBySignature.Keys)) { if (-not $signatures.Contains($signature)) { [void]$signatures.Add($signature) } }
+        foreach ($signature in @($rightBySignature.Keys)) { if (-not $signatures.Contains($signature)) { [void]$signatures.Add($signature) } }
+        foreach ($signature in $signatures)
+        {
+            $leftCount = if ($leftBySignature.ContainsKey($signature)) { $leftBySignature[$signature].Count } else { 0 }
+            $rightCount = if ($rightBySignature.ContainsKey($signature)) { $rightBySignature[$signature].Count } else { 0 }
+            $shared = [Math]::Min($leftCount, $rightCount)
+            for ($i = $shared; $i -lt $leftCount; $i++) { $leftOnly.Add($leftBySignature[$signature][$i]) }
+            for ($i = $shared; $i -lt $rightCount; $i++) { $rightOnly.Add($rightBySignature[$signature][$i]) }
+        }
+        if ($leftOnly.Count -eq 0 -and $rightOnly.Count -eq 0) { return }
+
+        $leftByLabel = @{}
+        foreach ($item in (Get-EnumeratedItems $leftOnly))
+        {
+            $label = Get-ComparableLabel $item
+            if (-not $leftByLabel.ContainsKey($label)) { $leftByLabel[$label] = New-Object System.Collections.Generic.List[object] }
+            $leftByLabel[$label].Add($item)
+        }
+        $rightByLabel = @{}
+        foreach ($item in (Get-EnumeratedItems $rightOnly))
+        {
+            $label = Get-ComparableLabel $item
+            if (-not $rightByLabel.ContainsKey($label)) { $rightByLabel[$label] = New-Object System.Collections.Generic.List[object] }
+            $rightByLabel[$label].Add($item)
+        }
+        $labels = New-Object System.Collections.Generic.List[string]
+        foreach ($label in @($leftByLabel.Keys)) { if (-not $labels.Contains($label)) { [void]$labels.Add($label) } }
+        foreach ($label in @($rightByLabel.Keys)) { if (-not $labels.Contains($label)) { [void]$labels.Add($label) } }
+        $labels.Sort()
+        foreach ($label in $labels)
+        {
+            $leftItems = $null
+            $rightItems = $null
+            if ($leftByLabel.ContainsKey($label)) { $leftItems = $leftByLabel[$label] }
+            if ($rightByLabel.ContainsKey($label)) { $rightItems = $rightByLabel[$label] }
+            $leftCount = 0
+            $rightCount = 0
+            if ($null -ne $leftItems) { $leftCount = $leftItems.Count }
+            if ($null -ne $rightItems) { $rightCount = $rightItems.Count }
+            $next = "$Prefix[$label]"
+            if ($leftCount -eq 1 -and $rightCount -eq 1 -and $leftItems[0] -is [System.Collections.IDictionary] -and $rightItems[0] -is [System.Collections.IDictionary])
+            {
+                Add-ComparableDifference -Left $leftItems[0] -Right $rightItems[0] -Prefix $next -Paths $Paths
+            }
+            else
+            {
+                if ($leftCount -gt 0) { $Paths.Add("$next only on source") }
+                if ($rightCount -gt 0) { $Paths.Add("$next only on target") }
+            }
+        }
+    }
+
+    function Add-ComparableDifference
+    {
+        param($Left, $Right, [string] $Prefix, $Paths)
+
+        if ($null -eq $Left -and $null -eq $Right) { return }
+        $here = if ([string]::IsNullOrEmpty($Prefix)) { 'policy' } else { $Prefix }
+        if ($null -eq $Left -or $null -eq $Right)
+        {
+            $Paths.Add($here)
+            return
+        }
+
+        $leftList = $Left -is [System.Array]
+        $rightList = $Right -is [System.Array]
+        if ($leftList -and -not $rightList -and $Left.Length -eq 1)
+        {
+            Add-ComparableDifference -Left $Left[0] -Right $Right -Prefix $here -Paths $Paths
+            return
+        }
+        if ($rightList -and -not $leftList -and $Right.Length -eq 1)
+        {
+            Add-ComparableDifference -Left $Left -Right $Right[0] -Prefix $here -Paths $Paths
+            return
+        }
+
+        if ($Left -is [System.Collections.IDictionary] -and $Right -is [System.Collections.IDictionary])
+        {
+            $names = New-Object System.Collections.Generic.List[string]
+            foreach ($key in @($Left.Keys)) { if (-not $names.Contains([string]$key)) { [void]$names.Add([string]$key) } }
+            foreach ($key in @($Right.Keys)) { if (-not $names.Contains([string]$key)) { [void]$names.Add([string]$key) } }
+            $names.Sort()
+            foreach ($name in $names)
+            {
+                $next = if ([string]::IsNullOrEmpty($Prefix)) { $name } else { "$Prefix.$name" }
+                if ($Left.Contains($name) -and $Right.Contains($name))
+                {
+                    Add-ComparableDifference -Left $Left[$name] -Right $Right[$name] -Prefix $next -Paths $Paths
+                }
+                else
+                {
+                    $Paths.Add($next)
+                }
+            }
+            return
+        }
+
+        if ($leftList -and $rightList)
+        {
+            Add-ListDifference -Left $Left -Right $Right -Prefix $here -Paths $Paths
+            return
+        }
+
+        $leftJson = ConvertTo-Json $Left -Depth 100 -Compress
+        $rightJson = ConvertTo-Json $Right -Depth 100 -Compress
+        if ($leftJson -ne $rightJson) { $Paths.Add($here) }
+    }
+
+    function Get-PolicyDifferencePaths
+    {
+        param($Source, $Target, $SourceCatalog, $TargetCatalog)
+
+        if (-not $SourceCatalog) { $SourceCatalog = $script:SourceObjectCache }
+        if (-not $TargetCatalog) { $TargetCatalog = $script:TargetObjectByExtId }
+        $paths = New-Object System.Collections.Generic.List[string]
+        $left = ConvertTo-ComparablePolicy -Policy $Source -Catalog $SourceCatalog
+        $right = ConvertTo-ComparablePolicy -Policy $Target -Catalog $TargetCatalog -StripRenamePrefix
+        Add-ComparableDifference -Left $left -Right $right -Prefix '' -Paths $paths
+        return ,$paths.ToArray()
+    }
+
+    #Prism adds this rule for each secured group. A same-named rule with its own services or destinations is a user rule.
+    function Test-GeneratedOutboundDefaultRule
+    {
+        param($Rule)
+
+        if ([string]$Rule.description -ne 'Outbound default rule') { return $false }
+        $spec = $Rule.spec
+        if (-not $spec) { return $false }
+        if ([string]$spec.destAllowSpec -ne 'ALL') { return $false }
+        if ($spec.isAllProtocolAllowed -ne $true) { return $false }
+        foreach ($name in @('tcpServices','udpServices','icmpServices','serviceGroupReferences','destCategoryReferences','destAddressGroupReferences','srcCategoryReferences','srcAddressGroupReferences'))
+        {
+            foreach ($item in (Get-EnumeratedItems $spec.$name))
+            {
+                if ($null -ne $item -and -not [string]::IsNullOrEmpty([string]$item)) { return $false }
+            }
+        }
+        if (-not [string]::IsNullOrEmpty([string]$spec.srcAllowSpec)) { return $false }
+        if (-not [string]::IsNullOrEmpty([string]$spec.securedGroupAction)) { return $false }
+        return $true
+    }
+
+    function New-SyncedPolicyContent
+    {
+        param($Policy, [string] $PolicyName, [switch] $OmitGeneratedOutboundRules)
+        $rules = $Policy.data.rules
+        if ($OmitGeneratedOutboundRules)
+        {
+            $kept = New-Object System.Collections.Generic.List[object]
+            foreach ($rule in (Get-EnumeratedItems $rules))
+            {
+                if ($null -eq $rule) { continue }
+                if (Test-GeneratedOutboundDefaultRule $rule) { continue }
+                $kept.Add($rule)
+            }
+            $rules = $kept.ToArray()
+        }
+        $content = @{
+            name = $PolicyName
+            type = $Policy.data.type
+            description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+            state = $Policy.data.state
+            rules = $rules
+            isIpv6TrafficAllowed = $Policy.data.isIpv6TrafficAllowed
+            isHitlogEnabled = $Policy.data.isHitlogEnabled
+        }
+        if ($Policy.data.scope -ne 'GLOBAL') { $content.vpcReferences = $Policy.data.vpcReferences }
+        else { $content.scope = $Policy.data.scope }
+        return $content
+    }
+
+    function Invoke-PrismDeleteSet
+    {
+        param($Entries)
+        $items = @($Entries | Where-Object { $_ -and $_.Url })
+        if ($items.Count -eq 0) { return }
+        $requests = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $items)
+        {
+            Write-Host "$(Get-Date) [INFO] Deleting $($item.Label) on $targetPc" -ForegroundColor Green
+            $requests.Add([pscustomobject]@{
+                Id = [string]$item.Name
+                Method = 'DELETE'
+                Url = $item.Url
+                NtnxReqId = [string](New-Guid)
+            })
+        }
+        foreach ($result in @(Invoke-PrismRequestBatch -Requests $requests))
+        {
+            if (-not $result.Ok) { Throw "$(Get-Date) [ERROR] Failed to delete $($result.Id): $($result.Error)" }
+            Write-Host "$(Get-Date) [SUCCESS] Deleted $($result.Id) on $targetPc" -ForegroundColor Cyan
         }
     }
 
@@ -1009,304 +2669,155 @@ public static void Ignore()
     {#syncs Prism categories used in a given network policy
         param
         (
-            [Parameter(Mandatory)]
-            $policy
+            [Parameter(Mandatory)] $policy,
+            [Parameter(Mandatory)] $TargetCategoryIndex,
+            [ValidateSet('All','Map','Rewrite')][string] $Phase = 'All'
         )
 
         begin {}
 
         process
         {
-            #region which categories are used?
-            #* figure out categories used in this policy
-            Write-Host "$(get-date) [INFO] Examining categories..." -ForegroundColor Green
-            [System.Collections.ArrayList]$used_categories_list = New-Object System.Collections.ArrayList($null)
-            [System.Collections.ArrayList]$used_category_uuids_list = New-Object System.Collections.ArrayList($null)
-            #types of Policies (where categories are listed varies depending on the type of policy):
-            if ($policy.data.type -eq "ISOLATION")
-            {#this is an isolation policy
-                Write-Host "$(get-date) [INFO] Policy $($policy.data.name) is an Isolation policy..." -ForegroundColor Green
-                foreach ($rule in ($policy.data.rules))
+            if (-not $script:ExtIdMap) { $script:ExtIdMap = @{} }
+            if ($Phase -eq 'Rewrite')
+            {
+                if ($policy.data.type -eq "APPLICATION")
                 {
-                    if ($rule.spec.firstIsolationGroup){
-                        foreach ($categoryExtId in $rule.spec.firstIsolationGroup)
-                        {#process each category used in first isolation group
-                            $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                        }
-                    }
-                    if ($rule.spec.secondIsolationGroup){
-                        foreach ($categoryExtId in $rule.spec.secondIsolationGroup)
-                        {#process each category used in second isolation group
-                            $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                        }
-                    }
-                    if ($rule.spec.spec.isolationGroups){
-                        for ($i = 0; $i -lt $rule.spec.spec.isolationGroups.Count; $i++)
-                        {
-                            foreach ($categoryExtId in $rule.spec.spec.isolationGroups[$i].groupCategoryReferences)
-                            {#process each category used in second isolation group
-                                $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                            }
-                        }
+                    Update-PolicyRuleReferences -Policy $policy -PropertyNames @('securedGroupCategoryReferences','srcCategoryReferences','destCategoryReferences')
+                }
+                elseif ($policy.data.type -eq "ISOLATION")
+                {
+                    Update-PolicyRuleReferences -Policy $policy -PropertyNames @('firstIsolationGroup','secondIsolationGroup') -IncludeIsolationGroups
+                }
+                return
+            }
 
+            Write-Host "$(get-date) [INFO] Examining categories..." -ForegroundColor Green
+            $sourceIds = @{}
+            $usedPairs = New-Object System.Collections.Generic.List[string]
+
+            if ($policy.data.type -eq "ISOLATION")
+            {
+                Write-Host "$(get-date) [INFO] Policy $($policy.data.name) is an Isolation policy..." -ForegroundColor Green
+                foreach ($rule in @($policy.data.rules))
+                {
+                    if (-not $rule.spec) { continue }
+                    foreach ($categoryExtId in @($rule.spec.firstIsolationGroup)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
+                    foreach ($categoryExtId in @($rule.spec.secondIsolationGroup)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
+                    if ($rule.spec.spec -and $rule.spec.spec.isolationGroups)
+                    {
+                        foreach ($group in @($rule.spec.spec.isolationGroups))
+                        {
+                            foreach ($categoryExtId in @($group.groupCategoryReferences)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
+                        }
                     }
                 }
             }
             elseif ($policy.data.type -eq "APPLICATION")
-            {#this is an app policy
+            {
                 Write-Host "$(get-date) [INFO] Policy $($policy.data.name) is an Application policy..." -ForegroundColor Green
-                foreach ($rule in ($policy.data.rules))
+                foreach ($rule in @($policy.data.rules))
                 {
-                    if ($rule.spec.securedGroupCategoryReferences){
-                        foreach ($categoryExtId in $rule.spec.securedGroupCategoryReferences)
-                        {#process each category used in secured group
-                            $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                        }
-                    }
-                    if ($rule.spec.srcCategoryReferences){
-                        foreach ($categoryExtId in $rule.spec.srcCategoryReferences)
-                        {#process each category used in inbound_allow_list
-                            $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                        }
-                    }
-                    if ($rule.spec.destCategoryReferences){
-                        foreach ($categoryExtId in $rule.spec.destCategoryReferences)
-                        {#process each category used in inbound_allow_list
-                            $used_category_uuids_list.Add($categoryExtId) | Out-Null
-                        }
-                    }
+                    if (-not $rule.spec) { continue }
+                    foreach ($categoryExtId in @($rule.spec.securedGroupCategoryReferences)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
+                    foreach ($categoryExtId in @($rule.spec.srcCategoryReferences)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
+                    foreach ($categoryExtId in @($rule.spec.destCategoryReferences)) { if ($categoryExtId) { $sourceIds[[string]$categoryExtId] = $true } }
                 }
             }
             else
-            {#we don't know what type of Policy this is
+            {
                 Write-Host "$(get-date) [WARNING] Policy $($policy.data.name) is not a supported policy type for replication!" -ForegroundColor Yellow
+                return
             }
-            foreach ($category_uuid in ($used_category_uuids_list | Select-Object -Unique))
-            {# Get the category key value for each used category
-                $category_value_pair = Get-CategoryByExtId -pc $sourcePc -extId $category_uuid
-                $used_categories_list.Add($category_value_pair) | Out-Null
+
+            $missing = New-Object System.Collections.Generic.List[object]
+            foreach ($sourceExtId in @($sourceIds.Keys))
+            {
+                $sourceCategory = Get-CategoryByExtId -pc $sourcePc -extId $sourceExtId
+                if (-not $sourceCategory) { continue }
+                $usedPairs.Add("$($sourceCategory.key):$($sourceCategory.value)")
+
+                if ($script:ExtIdMap.ContainsKey($sourceExtId) -or ($script:AwaitingCreateExtId -and $script:AwaitingCreateExtId.ContainsKey($sourceExtId)))
+                {
+                    if ($debugme) { Write-Host "$(Get-Date) [DEBUG] Reusing mapped category $($sourceCategory.key):$($sourceCategory.value)" -ForegroundColor White }
+                    continue
+                }
+
+                $targetExtId = $null
+                if ($TargetCategoryIndex.ContainsKey([string]$sourceCategory.key) -and $TargetCategoryIndex[[string]$sourceCategory.key].ContainsKey([string]$sourceCategory.value))
+                {
+                    $targetExtId = $TargetCategoryIndex[[string]$sourceCategory.key][[string]$sourceCategory.value]
+                }
+
+                if ($targetExtId)
+                {
+                    Write-Host "$(Get-Date) [SUCCESS] Found the category:value pair $($sourceCategory.key):$($sourceCategory.value) in $targetPc" -ForegroundColor Cyan
+                    $script:ExtIdMap[$sourceExtId] = [string]$targetExtId
+                }
+                else
+                {
+                    Write-Host "$(get-date) [WARNING] The category:value pair specified ($($sourceCategory.key):$($sourceCategory.value)) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
+                    $missing.Add($sourceCategory)
+                }
             }
 
             Write-Host "$(get-date) [DATA] Flow policy $($policy.data.name) uses the following category:value pairs:" -ForegroundColor White
-            $used_categories_list | Select-Object -Unique
-            #endregion
+            $usedPairs | Select-Object -Unique | ForEach-Object { Write-Host $_ -ForegroundColor White }
 
-            #region are all used category:value pairs on target?
-                #* check each used category:value pair exists on target
-                [System.Collections.ArrayList]$missing_categories_list = New-Object System.Collections.ArrayList($null)
-                foreach ($category_value_pair in ($used_categories_list | Select-Object -Unique))
-                {#process each used category
-                    $category = ($category_value_pair -split ":")[0]
-                    $value = ($category_value_pair -split ":")[1]
-                    $filter = "`$filter=key eq '$($category)' and value eq '$($value)'"
-                    $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories?{1}" -f $targetPc,$filter
-                    $method = "GET"
+            if ($missing.Count -gt 0)
+            {
+                Write-Host "$(get-date) [DATA] The following category:value pairs need to be added on $($targetPc):" -ForegroundColor White
+                foreach ($sourceCategory in $missing) { Write-Host "$($sourceCategory.key):$($sourceCategory.value)" -ForegroundColor White }
+            }
 
-                    Write-Host "$(Get-Date) [INFO] Checking category:value pair $($category):$($value) exists in $targetPc..." -ForegroundColor Green
-                    try
+            if ($Phase -eq 'Map')
+            {
+                if (-not $script:PendingCategoryIds) { $script:PendingCategoryIds = @{} }
+                foreach ($sourceCategory in $missing)
+                {
+                    $pendingId = [string]$sourceCategory.extId
+                    if ($pendingId -and -not $script:PendingCategoryIds.ContainsKey($pendingId))
                     {
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                        if ($resp.metadata.totalAvailableResults -eq 0)
-                        {
-                            Write-Host "$(get-date) [WARNING] The category:value pair specified ($($category):$($value)) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
-                            $missing_categories_list.Add($category_value_pair) | Out-Null
-                            Continue
-                        }
-                        else
-                        {
-                            Write-Host "$(Get-Date) [SUCCESS] Found the category:value pair $($category):$($value) in $targetPc" -ForegroundColor Cyan
-                            #the category already exists on target, let's update the uuid reference in the policy
-                            $target_category_uuid = $resp.data.extId
-                            #get source category uuid
-                            $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories?{1}" -f $sourcePc,$filter
-                            $method = "GET"
-                            $source_category = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                            if ($policy.data.type -eq "APPLICATION")
-                            {
-                                foreach ($rule in ($policy.data.rules))
-                                {
-                                    for ($i = 0; $i -lt $rule.spec.securedGroupCategoryReferences.Count; $i++)
-                                    {
-                                        if ($rule.spec.securedGroupCategoryReferences[$i] -eq $source_category.data.extId)
-                                        {#that address group is used in inbound list
-                                            $rule.spec.securedGroupCategoryReferences[$i] = $target_category_uuid
-                                        }
-                                    }
-                                    for ($i = 0; $i -lt $rule.spec.srcCategoryReferences.Count; $i++)
-                                    {
-                                        if ($rule.spec.srcCategoryReferences[$i] -eq $source_category.data.extId)
-                                        {#that address group is used in inbound list
-                                            $rule.spec.srcCategoryReferences[$i] = $target_category_uuid
-                                        }
-                                    }
-                                    for ($i = 0; $i -lt $rule.spec.destCategoryReferences.Count; $i++)
-                                    {
-                                        if ($rule.spec.destCategoryReferences[$i] -eq $source_category.data.extId)
-                                        {#that address group is used in outbound list
-                                            $rule.spec.destCategoryReferences[$i] = $target_category_uuid
-                                        }
-                                    }
-                                }
-                            }
-                            elseif (($policy.data.type -eq "ISOLATION"))
-                            {
-                                foreach ($rule in ($policy.data.rules))
-                                {
-
-                                    for ($i = 0; $i -lt $rule.spec.firstIsolationGroup.Count; $i++)
-                                    {
-                                        if ($rule.spec.firstIsolationGroup[$i] -eq $source_category.data.extId)
-                                        {#that address group is used in inbound list
-                                            $rule.spec.firstIsolationGroup[$i] = $target_category_uuid
-                                        }
-                                    }
-                                    for ($i = 0; $i -lt $rule.spec.secondIsolationGroup.Count; $i++)
-                                    {
-                                        if ($rule.spec.secondIsolationGroup[$i] -eq $source_category.data.extId)
-                                        {#that address group is used in outbound list
-                                            $rule.spec.secondIsolationGroup[$i] = $target_category_uuid
-                                        }
-                                    }
-                                    for ($i = 0; $i -lt $rule.spec.spec.isolationGroups.Count; $i++)
-                                    {
-                                        for($j = 0; $j -lt $rule.spec.spec.isolationGroups[$i].groupCategoryReferences.Count; $j++)
-                                        {
-                                            if ($rule.spec.spec.isolationGroups[$i].groupCategoryReferences[$j] -eq $source_category.data.extId)
-                                            {#that address group is used in outbound list
-                                                $rule.spec.spec.isolationGroups[$i].groupCategoryReferences[$j] = $target_category_uuid
-                                             }
-                                        }
-
-                                    }
-
-                                }
-
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        $saved_error = $_.Exception.Message
-                        $error_code = ($saved_error -split " ")[3]
-                        if ($error_code -eq "404")
-                        {
-                            Write-Host "$(get-date) [WARNING] The category:value pair specified ($($category):$($value)) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
-                            $missing_categories_list.Add($category_value_pair) | Out-Null
-                            Continue
-                        }
-                        else
-                        {
-                            Write-Host "$saved_error" -ForegroundColor Yellow
-                            Continue
-                        }
+                        $script:PendingCategoryIds[$pendingId] = $sourceCategory
                     }
                 }
-                if ($missing_categories_list)
-                {#there are missing categories on target
-                    Write-Host "$(get-date) [DATA] The following category:value pairs need to be added on $($targetPc):" -ForegroundColor White
-                    $missing_categories_list
+                return
+            }
+
+            foreach ($sourceCategory in $missing)
+            {
+                $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories" -f $targetPc
+                $content = @{
+                    key = $sourceCategory.key
+                    description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                    value = [string]$sourceCategory.value
                 }
-            #endregion
-
-            #region create missing category:value pairs on target
-                [System.Collections.ArrayList]$processed_categories_list = New-Object System.Collections.ArrayList($null)
-                foreach ($category_value_pair in $missing_categories_list)
-                {#process all missing categories and values
-                    $category = ($category_value_pair -split ":")[0]
-                    $value = ($category_value_pair -split ":")[1]
-
-                    #add category key value
-                    $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories" -f $targetPc
-                    $method = "POST"
-                    $content = @{
-                        key=$category;
-                        description="added by Invoke-FlowRuleSyncNG.ps1 script";
-                        value="$value"
-                    }
-                    $payload = (ConvertTo-Json $content -Depth 4)
-                    try
-                    {#add the value
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload
-                        Write-Host "$(Get-Date) [SUCCESS] Added category $($category):$($value) in $targetPc" -ForegroundColor Cyan
-                        if ($debugme) {$resp}
-                        #Get-PrismCentralTaskStatus -task $resp -credential $prismCredentials -cluster $targetPc
-
-                        #Let's update the uuid reference in the policy for the newly created category
-                        $target_category_uuid = $resp.data.extId
-                        #get source category uuid
-                        $filter = "`$filter=key eq '$($category)' and value eq '$($value)'"
-                        $url = "https://{0}:9440/api/prism/v4.0.a2/config/categories?{1}" -f $sourcePc,$filter
-                        $method = "GET"
-                        $source_category = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                        if ($policy.data.type -eq "APPLICATION")
-                        {
-                            foreach ($rule in ($policy.data.rules))
-                            {
-                                for ($i = 0; $i -lt $rule.spec.securedGroupCategoryReferences.Count; $i++)
-                                {
-                                    if ($rule.spec.securedGroupCategoryReferences[$i] -eq $source_category.data.extId)
-                                    {#that address group is used in inbound list
-                                        $rule.spec.securedGroupCategoryReferences[$i] = $target_category_uuid
-                                    }
-                                }
-                                for ($i = 0; $i -lt $rule.spec.srcCategoryReferences.Count; $i++)
-                                {
-                                    if ($rule.spec.srcCategoryReferences[$i] -eq $source_category.data.extId)
-                                    {#that address group is used in inbound list
-                                        $rule.spec.srcCategoryReferences[$i] = $target_category_uuid
-                                    }
-                                }
-                                for ($i = 0; $i -lt $rule.spec.destCategoryReferences.Count; $i++)
-                                {
-                                    if ($rule.spec.destCategoryReferences[$i] -eq $source_category.data.extId)
-                                    {#that address group is used in outbound list
-                                        $rule.spec.destCategoryReferences[$i] = $target_category_uuid
-                                    }
-                                }
-                            }
-                        }
-                        elseif (($policy.data.type -eq "ISOLATION"))
-                        {
-                            foreach ($rule in ($policy.data.rules))
-                            {
-
-                                for ($i = 0; $i -lt $rule.spec.firstIsolationGroup.Count; $i++)
-                                {
-                                    if ($rule.spec.firstIsolationGroup[$i] -eq $source_category.data.extId)
-                                    {#that address group is used in inbound list
-                                        $rule.spec.firstIsolationGroup[$i] = $target_category_uuid
-                                    }
-                                }
-                                for ($i = 0; $i -lt $rule.spec.secondIsolationGroup.Count; $i++)
-                                {
-                                    if ($rule.spec.secondIsolationGroup[$i] -eq $source_category.data.extId)
-                                    {#that address group is used in outbound list
-                                        $rule.spec.secondIsolationGroup[$i] = $target_category_uuid
-                                    }
-                                }
-                                for ($i = 0; $i -lt $rule.spec.spec.isolationGroups.Count; $i++)
-                                {
-                                    for ($j = 0; $j -lt $rule.spec.spec.isolationGroups[$i].groupCategoryReferences.Count; $j++)
-                                    {
-                                        if ($rule.spec.spec.isolationGroups[$i].groupCategoryReferences[$j] -eq $source_category.data.extId)
-                                        {
-                                            #that address group is used in outbound list
-                                            $rule.spec.spec.isolationGroups[$i].groupCategoryReferences[$j] = $target_category_uuid
-                                        }
-                                    }
-
-                                }
-
-                            }
-
-                        }
-                    }
-                    catch
-                    {#we couldn't add the value
-                        Throw "$($_.Exception.Message)"
-                    }
+                $payload = (ConvertTo-Json $content -Depth 4)
+                try
+                {
+                    $resp = Invoke-RateLimitedApiCall -method POST -url $url -credential $prismCredentials -payload $payload
+                    Write-Host "$(Get-Date) [SUCCESS] Added category $($sourceCategory.key):$($sourceCategory.value) in $targetPc" -ForegroundColor Cyan
+                    if ($debugme) { $resp }
+                    $filter = ConvertTo-ODataFilterQuery -Expression ("key eq {0} and value eq {1}" -f (ConvertTo-ODataStringLiteral ([string]$sourceCategory.key)), (ConvertTo-ODataStringLiteral ([string]$sourceCategory.value)))
+                    $lookupUrl = "https://{0}:9440/api/prism/v4.0.a2/config/categories?{1}" -f $targetPc, $filter
+                    $targetExtId = Get-CreatedExtId -Response $resp -LookupUrl $lookupUrl
+                    $script:ExtIdMap[[string]$sourceCategory.extId] = $targetExtId
+                    Add-CategoryToIndex -Index $TargetCategoryIndex -Key $sourceCategory.key -Value $sourceCategory.value -ExtId $targetExtId
                 }
-            #endregion
+                catch
+                {
+                    Throw "$($_.Exception.Message)"
+                }
+            }
+
+            if ($policy.data.type -eq "APPLICATION")
+            {
+                Update-PolicyRuleReferences -Policy $policy -PropertyNames @('securedGroupCategoryReferences','srcCategoryReferences','destCategoryReferences')
+            }
+            elseif ($policy.data.type -eq "ISOLATION")
+            {
+                Update-PolicyRuleReferences -Policy $policy -PropertyNames @('firstIsolationGroup','secondIsolationGroup') -IncludeIsolationGroups
+            }
         }
 
         end {}
@@ -1316,201 +2827,153 @@ public static void Ignore()
     {#syncs Prism address groups used in a given network policy
         param
         (
-            [Parameter(Mandatory)]
-            $policy
+            [Parameter(Mandatory)] $policy,
+            [Parameter(Mandatory)] $TargetByName,
+            [ValidateSet('All','Map','Rewrite')][string] $Phase = 'All'
         )
 
         begin {}
 
         process
         {
-            #region GET address groups from target
-                Write-Host ""
-                Write-Host "$(get-date) [STEP] Getting address groups from target..." -ForegroundColor Magenta
-
-                #region process target
-                    Write-Host "$(get-date) [INFO] Retrieving list of address groups from the target Prism Central instance $($targetPc)..." -ForegroundColor Green
-                    $target_address_groups = Get-MicrosegObjectList -pc $targetPc -object "address-groups"
-                    Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of address groups from the target Prism Central instance $($targetPc)" -ForegroundColor Cyan
-                    Write-Host "$(get-date) [DATA] There are $($target_address_groups.count) address groups on target Prism Central $($targetPc)..." -ForegroundColor White
-                #endregion
-            #endregion
-
-            #region which address groups are used?
-                #* figure out address groups used in this policy
-                Write-Host "$(get-date) [INFO] Examining address groups..." -ForegroundColor Green
-                [System.Collections.ArrayList]$used_address_group_list = New-Object System.Collections.ArrayList($null)
+            if (-not $script:ExtIdMap) { $script:ExtIdMap = @{} }
+            if ($Phase -eq 'Rewrite')
+            {
                 if ($policy.data.type -eq "APPLICATION")
-                {#this is an app policy
-                    foreach ($rule in ($policy.data.rules))
-                    {
-                        if ($rule.spec.srcAddressGroupReferences){
-                            foreach ($address_group_extId in $rule.spec.srcAddressGroupReferences)
-                            {#process each address group used in inbound_allow_list
-                                $used_address_group_list.Add($address_group_extId) | Out-Null
-                            }
-                        }
-                        if ($rule.spec.destAddressGroupReferences){
-                            foreach ($address_group_extId in $rule.spec.destAddressGroupReferences)
-                            {#process each address group used in outbound_allow_list
-                                $used_address_group_list.Add($address_group_extId) | Out-Null
-                            }
-                        }
-                    }
+                {
+                    Update-PolicyRuleReferences -Policy $policy -PropertyNames @('srcAddressGroupReferences','destAddressGroupReferences')
                 }
-            #endregion
+                return
+            }
+            Write-Host "$(get-date) [INFO] Examining address groups..." -ForegroundColor Green
+            if ($policy.data.type -ne "APPLICATION") { return }
 
-            #region are all used address groups on the target?
+            $sourceIds = @{}
+            foreach ($rule in @($policy.data.rules))
+            {
+                if (-not $rule.spec) { continue }
+                foreach ($addressGroupExtId in @($rule.spec.srcAddressGroupReferences)) { if ($addressGroupExtId) { $sourceIds[[string]$addressGroupExtId] = $true } }
+                foreach ($addressGroupExtId in @($rule.spec.destAddressGroupReferences)) { if ($addressGroupExtId) { $sourceIds[[string]$addressGroupExtId] = $true } }
+            }
 
-                [System.Collections.ArrayList]$missing_address_groups_list = New-Object System.Collections.ArrayList($null)
-                foreach ($address_group_uuid in ($used_address_group_list | Select-Object -Unique))
-                {#process each used address group
-                    $api_server_endpoint = "/api/microseg/v4.0/config/address-groups/{0}" -f $address_group_uuid
-                    $url = "https://{0}:9440{1}" -f $sourcePc,$api_server_endpoint
-                    $method = "GET"
-
-                    $source_address_group = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                    if ($source_address_group.data.name -notin $target_address_groups.name)
-                    {#based on its name, that address group does not exist on the target
-                        $missing_address_groups_list.Add($source_address_group.data) | Out-Null
-                    }
-                    else
-                    {#the address group already exists on target, let's update the uuid reference in the policy
-                        $target_address_group_uuid = ($target_address_groups | Where-Object {$_.name -eq $source_address_group.data.name}).extId
-                        foreach ($rule in ($policy.data.rules))
-                        {
-                            for ($i = 0; $i -lt $rule.spec.srcAddressGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.srcAddressGroupReferences[$i] -eq $source_address_group.data.extId)
-                                {#that address group is used in inbound list
-                                    $rule.spec.srcAddressGroupReferences[$i] = $target_address_group_uuid
-                                }
-                            }
-                            for ($i = 0; $i -lt $rule.spec.destAddressGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.destAddressGroupReferences[$i] -eq $source_address_group.data.extId)
-                                {#that address group is used in outbound list
-                                    $rule.spec.destAddressGroupReferences[$i] = $target_address_group_uuid
-                                }
-                            }
-                        }
-                        if ($rename)
-                        {#Using rename option to rename address groups in target before enabling entity sync
-                            #Get address group etag
-                            $api_server_endpoint = "/api/microseg/v4.0/config/address-groups"
-                            $auth = @{ Authorization = "Basic "+ [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$($prismCredentials.UserName):$($prismCredentials.GetNetworkCredential().password)")) }
-                            $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$target_address_group_uuid
-                            $targetAgEtag = Invoke-WebRequest -Uri $url -SkipCertificateCheck -Headers $auth
-
-                            #Update address group
-                            $api_server_endpoint = "/api/microseg/v4.0/config/address-groups"
-                            $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$target_address_group_uuid
-                            $method = "PUT"
-                            $content = @{
-                                description="added by Invoke-FlowRuleSyncNG.ps1 script";
-                                name = $rename + "_" + $source_address_group.data.name
-                            }
-                            if ($source_address_group.data.ipv4Addresses)
-                            {
-                                $content.Add("ipv4Addresses",$source_address_group.data.ipv4Addresses)
-                            }
-                            if ($source_address_group.data.ipRanges)
-                            {
-                                $content.Add("ipRanges",$source_address_group.data.ipRanges)
-                            }
-                            $payload = (ConvertTo-Json $content -Depth 10)
-                            $ntnx_req_id = New-Guid
-                            $if_match = [System.String]($targetAgEtag.Headers.ETag)
-                            Write-Host "$(Get-Date) [INFO] Updating address group $($source_address_group.data.name) to $targetPc with name $($rename + "_" + $source_address_group.data.name)" -ForegroundColor Green
-                            try
-                            {#update address group
-                                $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
-                                Write-Host "$(Get-Date) [SUCCESS] Updated address group $($source_address_group.data.name) to $targetPc with name $($rename + "_" + $source_address_group.data.name)" -ForegroundColor Cyan
-                                if ($debugme) {$resp}
-                                #Get-PrismCentralTaskStatus -task $resp -credential $prismCredentials -cluster $targetPc
-                            }
-                            catch
-                            {#we couldn't update the address group
-                                Throw "$($_.Exception.Message)"
-                            }
-                        }
-                    }
+            $missing = New-Object System.Collections.Generic.List[object]
+            foreach ($sourceExtId in @($sourceIds.Keys))
+            {
+                if ($script:ExtIdMap.ContainsKey($sourceExtId) -or ($script:AwaitingCreateExtId -and $script:AwaitingCreateExtId.ContainsKey($sourceExtId)))
+                {
+                    if ($debugme) { Write-Host "$(Get-Date) [DEBUG] Reusing mapped address group $sourceExtId" -ForegroundColor White }
+                    continue
                 }
-                if ($missing_address_groups_list)
-                {#there are missing address groups
-                    Write-Host "$(get-date) [DATA] The following address groups need to be added on $($targetPc):" -ForegroundColor White
-                    $missing_address_groups_list.name
-                }
-            #endregion
 
-            #region create missing address groups on target
-                [System.Collections.ArrayList]$processed_address_groups_list = New-Object System.Collections.ArrayList($null)
-                foreach ($address_group in $missing_address_groups_list)
-                {#process all missing address groups
-                    #add address group
-                    $api_server_endpoint = "/api/microseg/v4.0/config/address-groups"
-                    $url = "https://{0}:9440{1}" -f $targetPc,$api_server_endpoint
-                    $method = "POST"
-                    $agname = $address_group.name
+                $url = "https://{0}:9440/api/microseg/v4.0/config/address-groups/{1}" -f $sourcePc, $sourceExtId
+                $sourceAg = Get-CachedSourceObject -extId $sourceExtId -url $url
+                if (-not $sourceAg) { continue }
+
+                if ($TargetByName.ContainsKey([string]$sourceAg.name))
+                {
+                    $target = $TargetByName[[string]$sourceAg.name]
+                    $script:ExtIdMap[$sourceExtId] = [string]$target.extId
                     if ($rename)
                     {
-                       $agname = $rename + "_" + $address_group.name
-                       Write-Host "$(Get-Date) [INFO] Adding address group $($address_group.name) to $targetPc with name $($agname)" -ForegroundColor Green
-                    }
-                    $content = @{
-                        description="added by Invoke-FlowRuleSyncNG.ps1 script";
-                        name=$agname
-                    }
-                    if ($address_group.ipv4Addresses)
-                    {
-                        $content.Add("ipv4Addresses",$address_group.ipv4Addresses)
-                    }
-                    if ($address_group.ipRanges)
-                    {
-                        $content.Add("ipRanges",$address_group.ipRanges)
-                    }
-                    $payload = (ConvertTo-Json $content -Depth 10)
-                    $ntnx_req_id = New-Guid
-                    Write-Host "$(Get-Date) [INFO] Adding address group $($address_group.name) to $targetPc" -ForegroundColor Green
-                    try
-                    {#add address group
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id
-                        Write-Host "$(Get-Date) [SUCCESS] Added address group $($address_group.name) to $targetPc" -ForegroundColor Cyan
-                        if ($debugme) {$resp}
-                        #Get-PrismCentralTaskStatus -task $resp -credential $prismCredentials -cluster $targetPc
-
-                        #Get the address group to get the uuid
-                        $api_server_endpoint = "/api/microseg/v4.0/config/address-groups/"
-                        $filter = "`$filter=name eq '$($agname)'"
-                        $url = "https://{0}:9440{1}?{2}" -f $targetPc,$api_server_endpoint,$filter
-                        $method = "GET"
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                        foreach ($rule in ($policy.data.rules))
+                        $newName = $rename + "_" + $sourceAg.name
+                        $etagUrl = "https://{0}:9440/api/microseg/v4.0/config/address-groups/{1}" -f $targetPc, $target.extId
+                        if ($Phase -eq 'Map')
                         {
-                            for ($i = 0; $i -lt $rule.spec.srcAddressGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.srcAddressGroupReferences[$i] -eq $address_group.extId)
-                                {#that address group is used in inbound allow list, let's update the uuid with that of the newly created address group
-                                    $rule.spec.srcAddressGroupReferences[$i] = $resp.data.extId
-                                }
-                            }
-                            for ($i = 0; $i -lt $rule.spec.destAddressGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.destAddressGroupReferences[$i] -eq $address_group.extId)
-                                {#that address group is used in outbound allow list, let's update the uuid with that of the newly created address group
-                                    $rule.spec.destAddressGroupReferences[$i] = $resp.data.extId
-                                }
-                            }
+                            Add-PendingRename -Kind 'AddressGroup' -Source $sourceAg -Target $target -TargetByName $TargetByName -NewName $newName -Url $etagUrl
+                        }
+                        else
+                        {
+                        $if_match = Invoke-RateLimitedApiCall -method GET -url $etagUrl -credential $prismCredentials -ReturnETag
+                        $content = @{
+                            description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                            name = $newName
+                        }
+                        if ($sourceAg.ipv4Addresses) { $content.Add("ipv4Addresses", $sourceAg.ipv4Addresses) }
+                        if ($sourceAg.ipRanges) { $content.Add("ipRanges", $sourceAg.ipRanges) }
+                        $payload = (ConvertTo-Json $content -Depth 10)
+                        $ntnx_req_id = New-Guid
+                        Write-Host "$(Get-Date) [INFO] Updating address group $($sourceAg.name) to $targetPc with name $newName" -ForegroundColor Green
+                        try
+                        {
+                            $resp = Invoke-RateLimitedApiCall -method PUT -url $etagUrl -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
+                            Write-Host "$(Get-Date) [SUCCESS] Updated address group $($sourceAg.name) to $targetPc with name $newName" -ForegroundColor Cyan
+                            if ($debugme) { $resp }
+                            $TargetByName.Remove([string]$sourceAg.name)
+                            $TargetByName[$newName] = $target
+                        }
+                        catch
+                        {
+                            Throw "$($_.Exception.Message)"
+                        }
                         }
                     }
-                    catch
-                    {#we couldn't add the address group
-                        Throw "$($_.Exception.Message)"
+                }
+                else
+                {
+                    $missing.Add($sourceAg)
+                }
+            }
+
+            if ($missing.Count -gt 0)
+            {
+                Write-Host "$(get-date) [DATA] The following address groups need to be added on $($targetPc):" -ForegroundColor White
+                foreach ($sourceAg in $missing) { Write-Host $sourceAg.name -ForegroundColor White }
+            }
+
+            if ($Phase -eq 'Map')
+            {
+                if (-not $script:PendingAddressGroups) { $script:PendingAddressGroups = @{} }
+                foreach ($sourceAg in $missing)
+                {
+                    $pendingId = [string]$sourceAg.extId
+                    if ($pendingId -and -not $script:PendingAddressGroups.ContainsKey($pendingId))
+                    {
+                        $script:PendingAddressGroups[$pendingId] = $sourceAg
                     }
                 }
-            #endregion
+                return
+            }
+
+            foreach ($sourceAg in $missing)
+            {
+                $api_server_endpoint = "/api/microseg/v4.0/config/address-groups"
+                $url = "https://{0}:9440{1}" -f $targetPc, $api_server_endpoint
+                $agname = $sourceAg.name
+                if ($rename)
+                {
+                    $agname = $rename + "_" + $sourceAg.name
+                    Write-Host "$(Get-Date) [INFO] Adding address group $($sourceAg.name) to $targetPc with name $($agname)" -ForegroundColor Green
+                }
+                $content = @{
+                    description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                    name = $agname
+                }
+                if ($sourceAg.ipv4Addresses) { $content.Add("ipv4Addresses", $sourceAg.ipv4Addresses) }
+                if ($sourceAg.ipRanges) { $content.Add("ipRanges", $sourceAg.ipRanges) }
+                $payload = (ConvertTo-Json $content -Depth 10)
+                $ntnx_req_id = New-Guid
+                Write-Host "$(Get-Date) [INFO] Adding address group $($sourceAg.name) to $targetPc" -ForegroundColor Green
+                try
+                {
+                    $resp = Invoke-RateLimitedApiCall -method POST -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id
+                    Write-Host "$(Get-Date) [SUCCESS] Added address group $($sourceAg.name) to $targetPc" -ForegroundColor Cyan
+                    if ($debugme) { $resp }
+                    $filter = ConvertTo-ODataFilterQuery -Expression ("name eq {0}" -f (ConvertTo-ODataStringLiteral ([string]$agname)))
+                    $lookupUrl = "https://{0}:9440{1}?{2}" -f $targetPc, $api_server_endpoint, $filter
+                    $targetExtId = Get-CreatedExtId -Response $resp -LookupUrl $lookupUrl
+                    $script:ExtIdMap[[string]$sourceAg.extId] = $targetExtId
+                    if (-not $TargetByName.ContainsKey([string]$agname))
+                    {
+                        $TargetByName[[string]$agname] = [pscustomobject]@{ name = [string]$agname; extId = $targetExtId }
+                    }
+                }
+                catch
+                {
+                    Throw "$($_.Exception.Message)"
+                }
+            }
+
+            Update-PolicyRuleReferences -Policy $policy -PropertyNames @('srcAddressGroupReferences','destAddressGroupReferences')
         }
 
         end {}
@@ -1520,216 +2983,167 @@ public static void Ignore()
     {#syncs Prism service groups used in a given network policy
         param
         (
-            [Parameter(Mandatory)]
-            $policy
+            [Parameter(Mandatory)] $policy,
+            [Parameter(Mandatory)] $TargetByName,
+            [ValidateSet('All','Map','Rewrite')][string] $Phase = 'All'
         )
 
         begin {}
 
         process
         {
-            #region GET service groups from target
-                Write-Host ""
-                Write-Host "$(get-date) [STEP] Getting service groups in target PC..." -ForegroundColor Magenta
-
-                #region process target
-                    Write-Host "$(get-date) [INFO] Retrieving list of service groups from the target Prism Central instance $($targetPc)..." -ForegroundColor Green
-                    $filter = "`$filter=isSystemDefined eq false"
-                    $target_service_groups = Get-MicrosegObjectList -pc $targetPc -object "service-groups?$filter"
-                    Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of service groups from the target Prism Central instance $($targetPc)" -ForegroundColor Cyan
-                    Write-Host "$(get-date) [DATA] There are $($target_service_groups.count) service groups on target Prism Central $($targetPc)..." -ForegroundColor White
-                #endregion
-            #endregion
-
-            #region which service groups are used?
-                #* figure out service groups used in this policy
-                Write-Host "$(get-date) [INFO] Examining service groups..." -ForegroundColor Green
-                [System.Collections.ArrayList]$used_service_group_list = New-Object System.Collections.ArrayList($null)
+            if (-not $script:ExtIdMap) { $script:ExtIdMap = @{} }
+            if ($Phase -eq 'Rewrite')
+            {
                 if ($policy.data.type -eq "APPLICATION")
-                {#this is an app policy
-                    foreach ($rule in ($policy.data.rules))
-                    {
-                        if ($rule.spec.serviceGroupReferences){
-                            foreach ($service_group_extId in $rule.spec.serviceGroupReferences)
-                            {#process each service group used in nsp
-                                $used_service_group_list.Add($service_group_extId) | Out-Null
-                            }
-                        }
-                    }
+                {
+                    Update-PolicyRuleReferences -Policy $policy -PropertyNames @('serviceGroupReferences')
                 }
-            #endregion
+                return
+            }
+            Write-Host "$(get-date) [INFO] Examining service groups..." -ForegroundColor Green
+            if ($policy.data.type -ne "APPLICATION") { return }
 
-            #region are all used service groups on the target?
+            $sourceIds = @{}
+            foreach ($rule in @($policy.data.rules))
+            {
+                if (-not $rule.spec) { continue }
+                foreach ($serviceGroupExtId in @($rule.spec.serviceGroupReferences)) { if ($serviceGroupExtId) { $sourceIds[[string]$serviceGroupExtId] = $true } }
+            }
 
-                [System.Collections.ArrayList]$missing_service_groups_list = New-Object System.Collections.ArrayList($null)
-                foreach ($service_group_uuid in ($used_service_group_list | Select-Object -Unique))
-                {#process each used service group
-                    #find out what the service group name is (only uuid is kept in rule definition)
-                    $api_server_endpoint = "/api/microseg/v4.0/config/service-groups/{0}" -f $service_group_uuid
-                    $url = "https://{0}:9440{1}" -f $sourcePc,$api_server_endpoint
-                    $method = "GET"
+            $missing = New-Object System.Collections.Generic.List[object]
+            foreach ($sourceExtId in @($sourceIds.Keys))
+            {
+                if ($script:ExtIdMap.ContainsKey($sourceExtId) -or ($script:AwaitingCreateExtId -and $script:AwaitingCreateExtId.ContainsKey($sourceExtId)))
+                {
+                    if ($debugme) { Write-Host "$(Get-Date) [DEBUG] Reusing mapped service group $sourceExtId" -ForegroundColor White }
+                    continue
+                }
 
-                    $source_service_group = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
+                $url = "https://{0}:9440/api/microseg/v4.0/config/service-groups/{1}" -f $sourcePc, $sourceExtId
+                $sourceSg = Get-CachedSourceObject -extId $sourceExtId -url $url
+                if (-not $sourceSg) { continue }
 
-                    #Write-Host "$(Get-Date) [INFO] Checking service group $($source_service_group.service_group.name) exists in $targetPc..." -ForegroundColor Green
-                    if (!$source_service_group.data.isSystemDefined)
-                    {#there is no need to sync system defined service groups
-                        if ($source_service_group.data.name -notin $target_service_groups.name)
-                        {#based on its name, that service group does not exist on the target
-                            $missing_service_groups_list.Add($source_service_group.data) | Out-Null
-                        }
-                        else
-                        {#the service group already exists on target, let's update the uuid reference in the policy,
-                            $target_service_group_uuid = ($target_service_groups | Where-Object {$_.name -eq $source_service_group.data.name}).extId
-                            foreach ($rule in ($policy.data.rules))
-                            {
-                                for ($i = 0; $i -lt $rule.spec.serviceGroupReferences.Count; $i++)
-                                {
-                                    if ($rule.spec.serviceGroupReferences[$i] -eq $source_service_group.data.extId)
-                                    {
-                                        $rule.spec.serviceGroupReferences[$i] = $target_service_group_uuid
-                                    }
-                                }
-                            }
-                            if ($rename)
-                            {#Using rename option to rename address groups in target before enabling entity sync
-                                #Get service group etag
-                                $api_server_endpoint = "/api/microseg/v4.0/config/service-groups"
-                                $auth = @{ Authorization = "Basic "+ [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$($prismCredentials.UserName):$($prismCredentials.GetNetworkCredential().password)")) }
-                                $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$target_service_group_uuid
-                                $targetSgEtag = Invoke-WebRequest -Uri $url -SkipCertificateCheck -Headers $auth
-
-                                #Update service group
-                                $api_server_endpoint = "/api/microseg/v4.0/config/service-groups"
-                                $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$target_service_group_uuid
-                                $method = "PUT"
-                                $content = @{
-                                    description="added by Invoke-FlowRuleSyncNG.ps1 script";
-                                    name = $rename + "_" + $source_service_group.data.name
-                                }
-                                if ($source_service_group.data.tcpServices)
-                                {
-                                    $content.Add("tcpServices",$source_service_group.data.tcpServices)
-                                }
-                                if ($source_service_group.data.udpServices)
-                                {
-                                    $content.Add("udpServices",$source_service_group.data.udpServices)
-                                }
-                                if ($source_service_group.data.icmpServices)
-                                {
-                                    $content.Add("icmpServices",$source_service_group.data.icmpServices)
-                                }
-                                $payload = (ConvertTo-Json $content -Depth 10)
-                                $ntnx_req_id = New-Guid
-                                $if_match = [System.String]($targetSgEtag.Headers.ETag)
-                                Write-Host "$(Get-Date) [INFO] Updating service group $($source_service_group.data.name) to $targetPc with name $($rename + "_" + $source_service_group.data.name)" -ForegroundColor Green
-                                try
-                                {#update service group
-                                    $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
-                                    Write-Host "$(Get-Date) [SUCCESS] Updated service group $($source_service_group.data.name) to $targetPc with name $($rename + "_" + $source_service_group.data.name)" -ForegroundColor Cyan
-                                    if ($debugme) {$resp}
-                                    #Get-PrismCentralTaskStatus -task $resp -credential $prismCredentials -cluster $targetPc
-                                }
-                                catch
-                                {#we couldn't update the service group
-                                    Throw "$($_.Exception.Message)"
-                                }
-                            }
-                        }
+                if ($sourceSg.isSystemDefined)
+                {
+                    if ($TargetByName.ContainsKey([string]$sourceSg.name))
+                    {
+                        $script:ExtIdMap[$sourceExtId] = [string]$TargetByName[[string]$sourceSg.name].extId
                     }
                     else
-                    {#its a system defined service group, but we need to update the uuid reference in the policy
-                        $api_server_endpoint = "/api/microseg/v4.0/config/service-groups/"
-                        $filter = "`$filter=name eq '$($source_service_group.data.name)'"
-                        $url = "https://{0}:9440{1}?{2}" -f $targetPc,$api_server_endpoint,$filter
-                        $method = "GET"
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                        $target_service_group_uuid = $resp.data.extId
+                    {
+                        Write-Host "$(get-date) [WARNING] System defined service group $($sourceSg.name) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
+                    }
+                    continue
+                }
 
-                        foreach ($rule in ($policy.data.rules))
+                if ($TargetByName.ContainsKey([string]$sourceSg.name))
+                {
+                    $target = $TargetByName[[string]$sourceSg.name]
+                    $script:ExtIdMap[$sourceExtId] = [string]$target.extId
+                    if ($rename)
+                    {
+                        $newName = $rename + "_" + $sourceSg.name
+                        $etagUrl = "https://{0}:9440/api/microseg/v4.0/config/service-groups/{1}" -f $targetPc, $target.extId
+                        if ($Phase -eq 'Map')
                         {
-                            for ($i = 0; $i -lt $rule.spec.serviceGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.serviceGroupReferences[$i] -eq $source_service_group.data.extId)
-                                {
-                                    $rule.spec.serviceGroupReferences[$i] = $target_service_group_uuid
-                                }
-                            }
+                            Add-PendingRename -Kind 'ServiceGroup' -Source $sourceSg -Target $target -TargetByName $TargetByName -NewName $newName -Url $etagUrl
+                        }
+                        else
+                        {
+                        $if_match = Invoke-RateLimitedApiCall -method GET -url $etagUrl -credential $prismCredentials -ReturnETag
+                        $content = @{
+                            description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                            name = $newName
+                        }
+                        if ($sourceSg.tcpServices) { $content.Add("tcpServices", $sourceSg.tcpServices) }
+                        if ($sourceSg.udpServices) { $content.Add("udpServices", $sourceSg.udpServices) }
+                        if ($sourceSg.icmpServices) { $content.Add("icmpServices", $sourceSg.icmpServices) }
+                        $payload = (ConvertTo-Json $content -Depth 10)
+                        $ntnx_req_id = New-Guid
+                        Write-Host "$(Get-Date) [INFO] Updating service group $($sourceSg.name) to $targetPc with name $newName" -ForegroundColor Green
+                        try
+                        {
+                            $resp = Invoke-RateLimitedApiCall -method PUT -url $etagUrl -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
+                            Write-Host "$(Get-Date) [SUCCESS] Updated service group $($sourceSg.name) to $targetPc with name $newName" -ForegroundColor Cyan
+                            if ($debugme) { $resp }
+                            $TargetByName.Remove([string]$sourceSg.name)
+                            $TargetByName[$newName] = $target
+                        }
+                        catch
+                        {
+                            Throw "$($_.Exception.Message)"
+                        }
                         }
                     }
                 }
-
-                if ($missing_service_groups_list)
-                {#there are missing service groups
-                    Write-Host "$(get-date) [DATA] The following service groups need to be added on $($targetPc):" -ForegroundColor White
-                    $missing_service_groups_list.name
+                else
+                {
+                    $missing.Add($sourceSg)
                 }
-            #endregion
+            }
 
-            #region create missing service groups on target
-                [System.Collections.ArrayList]$processed_service_groups_list = New-Object System.Collections.ArrayList($null)
-                foreach ($service_group in $missing_service_groups_list)
-                {#process all missing service groups
-                    #add service group
-                    $api_server_endpoint = "/api/microseg/v4.0/config/service-groups"
-                    $url = "https://{0}:9440{1}" -f $targetPc,$api_server_endpoint
-                    $method = "POST"
-                    $sgname=$service_group.name
-                    if($rename)
-                    {
-                        $sgname= $rename + "_" + $service_group.name
-                        Write-Host "$(Get-Date) [INFO] Adding service group $($service_group.name) to $targetPc with name $($sgname)" -ForegroundColor Green
-                    }
-                    $content = @{
-                        description="added by Invoke-FlowRuleSyncNG.ps1 script";
-                        name=$sgname
-                    }
-                    if ($service_group.tcpServices)
-                    {
-                        $content.Add("tcpServices",$service_group.tcpServices)
-                    }
-                    if ($service_group.udpServices)
-                    {
-                        $content.Add("udpServices",$service_group.udpServices)
-                    }
-                    if ($service_group.icmpServices)
-                    {
-                        $content.Add("icmpServices",$service_group.icmpServices)
-                    }
-                    $payload = (ConvertTo-Json $content -Depth 10)
-                    $ntnx_req_id = New-Guid
-                    Write-Host "$(Get-Date) [INFO] Adding service group $($service_group.name) to $targetPc" -ForegroundColor Green
-                    try
-                    {#add service group
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id
-                        Write-Host "$(Get-Date) [SUCCESS] Added service group $($service_group.name) to $targetPc" -ForegroundColor Cyan
-                        if ($debugme) {$resp}
+            if ($missing.Count -gt 0)
+            {
+                Write-Host "$(get-date) [DATA] The following service groups need to be added on $($targetPc):" -ForegroundColor White
+                foreach ($sourceSg in $missing) { Write-Host $sourceSg.name -ForegroundColor White }
+            }
 
-                        #Get the service group to get the uuid
-                        $api_server_endpoint = "/api/microseg/v4.0/config/service-groups/"
-                        $filter = "`$filter=name eq '$($sgname)'"
-                        $url = "https://{0}:9440{1}?{2}" -f $targetPc,$api_server_endpoint,$filter
-                        $method = "GET"
-                        $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                        #let's update the uuid reference of the new service group in the policy
-                        foreach ($rule in ($policy.data.rules))
-                        {
-                            for ($i = 0; $i -lt $rule.spec.serviceGroupReferences.Count; $i++)
-                            {
-                                if ($rule.spec.serviceGroupReferences[$i] -eq $service_group.extId)
-                                {
-                                    $rule.spec.serviceGroupReferences[$i] = $resp.data.extId
-                                }
-                            }
-                        }
-                    }
-                    catch
-                    {#we couldn't add the service group
-                        Throw "$($_.Exception.Message)"
+            if ($Phase -eq 'Map')
+            {
+                if (-not $script:PendingServiceGroups) { $script:PendingServiceGroups = @{} }
+                foreach ($sourceSg in $missing)
+                {
+                    $pendingId = [string]$sourceSg.extId
+                    if ($pendingId -and -not $script:PendingServiceGroups.ContainsKey($pendingId))
+                    {
+                        $script:PendingServiceGroups[$pendingId] = $sourceSg
                     }
                 }
-            #endregion
+                return
+            }
+
+            foreach ($sourceSg in $missing)
+            {
+                $api_server_endpoint = "/api/microseg/v4.0/config/service-groups"
+                $url = "https://{0}:9440{1}" -f $targetPc, $api_server_endpoint
+                $sgname = $sourceSg.name
+                if ($rename)
+                {
+                    $sgname = $rename + "_" + $sourceSg.name
+                    Write-Host "$(Get-Date) [INFO] Adding service group $($sourceSg.name) to $targetPc with name $($sgname)" -ForegroundColor Green
+                }
+                $content = @{
+                    description = "added by Invoke-FlowRuleSyncNG.ps1 script"
+                    name = $sgname
+                }
+                if ($sourceSg.tcpServices) { $content.Add("tcpServices", $sourceSg.tcpServices) }
+                if ($sourceSg.udpServices) { $content.Add("udpServices", $sourceSg.udpServices) }
+                if ($sourceSg.icmpServices) { $content.Add("icmpServices", $sourceSg.icmpServices) }
+                $payload = (ConvertTo-Json $content -Depth 10)
+                $ntnx_req_id = New-Guid
+                Write-Host "$(Get-Date) [INFO] Adding service group $($sourceSg.name) to $targetPc" -ForegroundColor Green
+                try
+                {
+                    $resp = Invoke-RateLimitedApiCall -method POST -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id
+                    Write-Host "$(Get-Date) [SUCCESS] Added service group $($sourceSg.name) to $targetPc" -ForegroundColor Cyan
+                    if ($debugme) { $resp }
+                    $filter = ConvertTo-ODataFilterQuery -Expression ("name eq {0}" -f (ConvertTo-ODataStringLiteral ([string]$sgname)))
+                    $lookupUrl = "https://{0}:9440{1}?{2}" -f $targetPc, $api_server_endpoint, $filter
+                    $targetExtId = Get-CreatedExtId -Response $resp -LookupUrl $lookupUrl
+                    $script:ExtIdMap[[string]$sourceSg.extId] = $targetExtId
+                    if (-not $TargetByName.ContainsKey([string]$sgname))
+                    {
+                        $TargetByName[[string]$sgname] = [pscustomobject]@{ name = [string]$sgname; extId = $targetExtId }
+                    }
+                }
+                catch
+                {
+                    Throw "$($_.Exception.Message)"
+                }
+            }
+
+            Update-PolicyRuleReferences -Policy $policy -PropertyNames @('serviceGroupReferences')
         }
 
         end {}
@@ -1739,124 +3153,88 @@ public static void Ignore()
     {#syncs Prism VPC used in a given network policy
         param
         (
-            [Parameter(Mandatory)]
-            $policy
+            [Parameter(Mandatory)] $policy,
+            [Parameter(Mandatory)] $TargetVpcByName,
+            [ValidateSet('All','Map','Rewrite')][string] $Phase = 'All'
         )
 
         begin {}
 
         process
         {
-            #region which vpc are used?
-            #* figure out vpc used in this policy
+            if (-not $script:ExtIdMap) { $script:ExtIdMap = @{} }
+            if ($Phase -eq 'Rewrite')
+            {
+                Update-ReferenceProperty -Object $policy.data -PropertyName "vpcReferences" -Map $script:ExtIdMap
+                return
+            }
             Write-Host "$(get-date) [INFO] Examining vpc..." -ForegroundColor Green
-            [System.Collections.ArrayList]$used_vpc_list = New-Object System.Collections.ArrayList($null)
-            [System.Collections.ArrayList]$used_vpc_uuids_list = New-Object System.Collections.ArrayList($null)
+
+            $sourceIds = @{}
             if ($policy.data.type -eq "ISOLATION" -or $policy.data.type -eq "APPLICATION")
             {
                 Write-Host "$(get-date) [INFO] Policy $($policy.data.name) is an Isolation or Application policy..." -ForegroundColor Green
-                foreach ($vpcExtId in $policy.data.vpcReferences)
-                {#process each vpc used in first isolation/application group
-                    $used_vpc_uuids_list.Add($vpcExtId) | Out-Null
-                    if ($debugme) {Write-Host "$(get-date) [INFO] Policy vpcextId $($vpcExtId) " -ForegroundColor Green}
+                foreach ($vpcExtId in @($policy.data.vpcReferences))
+                {
+                    if ($vpcExtId)
+                    {
+                        $sourceIds[[string]$vpcExtId] = $true
+                        if ($debugme) { Write-Host "$(get-date) [INFO] Policy vpcextId $($vpcExtId) " -ForegroundColor Green }
+                    }
                 }
             }
-
             else
-            {#we don't know what type of Policy this is
+            {
                 Write-Host "$(get-date) [WARNING] Policy $($policy.data.name) is not a supported policy type for replication!" -ForegroundColor Yellow
+                return
             }
-            foreach ($vpc_uuid in ($used_vpc_uuids_list | Select-Object -Unique))
-            {# add vpc id for each vpc uuid
-                $vpc_name = Get-VpcByExtId -pc $sourcePc -extId $vpc_uuid
-                $used_vpc_list.Add($vpc_name) | Out-Null
+
+            $usedNames = New-Object System.Collections.Generic.List[string]
+            $missing = New-Object System.Collections.Generic.List[string]
+            foreach ($sourceExtId in @($sourceIds.Keys))
+            {
+                $sourceVpc = Get-VpcByExtId -pc $sourcePc -extId $sourceExtId
+                if (-not $sourceVpc) { continue }
+                $usedNames.Add([string]$sourceVpc.name)
+
+                if ($script:ExtIdMap.ContainsKey($sourceExtId))
+                {
+                    if ($debugme) { Write-Host "$(Get-Date) [DEBUG] Reusing mapped VPC $($sourceVpc.name)" -ForegroundColor White }
+                    continue
+                }
+
+                Write-Host "$(Get-Date) [INFO] Checking VPC $($sourceVpc.name) exists in $targetPc..." -ForegroundColor Green
+                if ($TargetVpcByName.ContainsKey([string]$sourceVpc.name))
+                {
+                    Write-Host "$(Get-Date) [SUCCESS] Found the VPC $($sourceVpc.name) in $targetPc" -ForegroundColor Cyan
+                    $script:ExtIdMap[$sourceExtId] = [string]$TargetVpcByName[[string]$sourceVpc.name].extId
+                }
+                else
+                {
+                    Write-Host "$(get-date) [WARNING] The VPC ($($sourceVpc.name)) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
+                    $missing.Add([string]$sourceVpc.name)
+                }
             }
 
             Write-Host "$(get-date) [DATA] Flow policy $($policy.data.name) uses the following VPC :" -ForegroundColor White
-            $used_vpc_list | Select-Object -Unique
-            #endregion
+            $usedNames | Select-Object -Unique | ForEach-Object { Write-Host $_ -ForegroundColor White }
 
-            #region are all used vpc on target?
-            #* check each used vpc exists on target
-            [System.Collections.ArrayList]$missing_vpc_list = New-Object System.Collections.ArrayList($null)
-            foreach ($vpc_name in ($used_vpc_list | Select-Object -Unique))
-            {#process each used vpc
-                $filter = "`$filter=name eq '$($vpc_name)'"
-                $url = "https://{0}:9440/api/networking/v4.0/config/vpcs?{1}" -f $targetPc,$filter
-                $method = "GET"
-
-                Write-Host "$(Get-Date) [INFO] Checking VPC $($vpc_name) exists in $targetPc..." -ForegroundColor Green
-                try
-                {
-                    $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                    if ($resp.metadata.totalAvailableResults -eq 0)
-                    {
-                        Write-Host "$(get-date) [WARNING] The VPC ($vpc_name) does not exist in Prism Central $targetPc" -ForegroundColor Yellow
-                        $missing_vpc_list.Add($vpc_name) | Out-Null
-                        Continue
-                    }
-                    else
-                    {
-                        Write-Host "$(Get-Date) [SUCCESS] Found the VPC $($vpc_name) in $targetPc" -ForegroundColor Cyan
-                        #the vpc already exists on target, let's update the uuid reference in the policy
-                        $target_vpc_uuid = $resp.data.extId
-                        #get source vpc uuid
-                        $url = "https://{0}:9440/api/networking/v4.0/config/vpcs?{1}" -f $sourcePc,$filter
-                        $method = "GET"
-                        $source_vpc = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-                        $source_vpc_extId = $source_vpc.data.extId
-                        if ($policy.data.type -eq "ISOLATION" -or $policy.data.type -eq "APPLICATION")
-                        {
-
-                            if ($debugme) {Write-Host "$(get-date) [WARNING] inside isolation/application policy with vpc count $($policy.data.vpcReferences.Count)" -ForegroundColor Yellow}
-                            for ($i = 0; $i -lt $policy.data.vpcReferences.Count; $i++)
-                            {
-                                if ($debugme) {Write-Host "$(get-date) [WARNING] inside vpc count loop " -ForegroundColor Yellow}
-                                if($policy.data.vpcReferences[$i] -eq $source_vpc_extId)
-                                {
-                                    $policy.data.vpcReferences[$i] = $target_vpc_uuid
-                                    Write-Host "$(get-date) [INFO] The source vpc ($($source_vpc_extId)  and vpc reference vpc ($($policy.data.vpcReferences[$i])) in source spec are the same in $sourcePc" -ForegroundColor Green
-                                }
-                                else
-                                {
-                                    Write-Host "$(get-date) [WARNING] The source vpc ($($source_vpc_extId)  and vpc reference ($($policy.data.vpcReferences[$i])) in source spec are not the same in $sourcePc" -ForegroundColor Yellow
-                                }
-
-                            }
-
-                        }
-
-                    }
-                }
-                catch
-                {
-                    $saved_error = $_.Exception.Message
-                    $error_code = ($saved_error -split " ")[3]
-                    if ($error_code -eq "404")
-                    {
-                        Write-Host "$(get-date) [WARNING] The VPC $($vpc_name) does not exists in  Prism Central" -ForegroundColor Yellow
-                        $missing_vpc_list.Add($vpc_name) | Out-Null
-                        Continue
-                    }
-                    else
-                    {
-                        Write-Host "$saved_error" -ForegroundColor Yellow
-                        Continue
-                    }
-                }
-            }
-            if ($missing_vpc_list)
-            {#there are missing VPC on target
+            if ($missing.Count -gt 0)
+            {
                 Write-Host "$(get-date) [DATA] The following VPCs need to be added on $($targetPc):" -ForegroundColor White
-                $missing_vpc_list
+                $missing | Select-Object -Unique | ForEach-Object { Write-Host $_ -ForegroundColor White }
             }
-            #endregion
 
             #TODO region create missing vpc on target
+            if ($Phase -ne 'Map')
+            {
+                Update-ReferenceProperty -Object $policy.data -PropertyName "vpcReferences" -Map $script:ExtIdMap
+            }
         }
 
         end {}
     }
+
 #endregion
 
 
@@ -1868,6 +3246,20 @@ Date       By              Updates (newest updates at the top)
 10/12/2024 pramod.singh   Initial release (based of PoSH script written by 
                           @nx-sbourdeaud).
 07/28/2025 nx-sbourdeaud  Making script compatible with new "Global" scope.
+10/21/2026 nx-sbourdeaud  Cache target catalogs and extId maps to avoid repeated Prism lookups.
+10/21/2026 nx-sbourdeaud  Overlap source and target Prism calls with a bounded runspace pool.
+10/21/2026 nx-sbourdeaud  Skip Flow policy updates when the rewritten policy already matches the target.
+10/22/2026 nx-sbourdeaud  Treat a Prism body of "undefined" as an empty response instead of a JSON parse failure.
+10/22/2026 nx-sbourdeaud  List source catalogs once and overlap category creates with later policy reads.
+10/22/2026 nx-sbourdeaud  Start MaxInFlight at 5 per Prism Central and lower a PC to 2 when it rate limits.
+10/22/2026 nx-sbourdeaud  Report each created object as its Prism call finishes instead of after the whole batch.
+10/22/2026 nx-sbourdeaud  Report each target policy as it is read for the update check.
+10/22/2026 nx-sbourdeaud  Ignore Prism's empty application-rule defaults and name the field that differs.
+10/22/2026 nx-sbourdeaud  Compare source and target policy bodies by catalog name, ignoring identity fields and list order.
+10/22/2026 nx-sbourdeaud  Leave Outbound default rule out of a new policy so Prism can create it.
+10/22/2026 nx-sbourdeaud  Keep a custom Outbound default rule and omit only the Allow All, All Traffic rule.
+10/22/2026 nx-sbourdeaud  Report each delete as INFO so STEP stays reserved for section headers.
+10/22/2026 nx-sbourdeaud  Retry a Prism 504 upstream timeout without lowering MaxInFlight.
 
 ################################################################################
 '@
@@ -1890,7 +3282,6 @@ Date       By              Updates (newest updates at the top)
 
 #region variables
     $myvarElapsedTime = [System.Diagnostics.Stopwatch]::StartNew() #used to store script begin timestamp
-    $length = 600
 #endregion
 
 
@@ -1917,25 +3308,27 @@ Date       By              Updates (newest updates at the top)
 #endregion
 
 #region main
+    $script:MaxInFlight = $MaxInFlight
+    Initialize-PrismRateGate
+    [PrismGateStore]::SetDefaultLimit($script:MaxInFlight)
+    Write-Host "$(get-date) [INFO] MaxInFlight starts at $script:MaxInFlight for each Prism Central." -ForegroundColor Green
 
     #region GET Flow policies
         Write-Host ""
         Write-Host "$(get-date) [STEP] Getting Flow policies" -ForegroundColor Magenta
-        #region process source
-            Write-Host "$(get-date) [INFO] Retrieving list of Flow policies from the source Prism Central instance $($sourcePc)..." -ForegroundColor Green
-            $source_nsp_response = Get-MicrosegObjectList -pc $sourcePc -object "policies"
-            Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of Flow policies from the source Prism Central instance $($sourcePc)" -ForegroundColor Cyan
-            $filtered_source_nsp_response = $source_nsp_response | Where-Object {$_.name -match "^$prefix"}
-            Write-Host "$(get-date) [DATA] There are $($filtered_source_nsp_response.count) Flow policies which match prefix $($prefix) on source Prism Central $($sourcePc)..." -ForegroundColor White
-        #endregion
-
-        #region process target
-            Write-Host "$(get-date) [INFO] Retrieving list of Flow policies from the target Prism Central instance $($targetPc)..." -ForegroundColor Green
-            $target_nsp_response = Get-MicrosegObjectList -pc $targetPc -object "policies"
-            Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of Flow policies from the target Prism Central instance $($targetPc)" -ForegroundColor Cyan
-            $filtered_target_nsp_response = $target_nsp_response | Where-Object {$_.name -match "^$prefix"}
-            Write-Host "$(get-date) [DATA] There are $($filtered_target_nsp_response.count) Flow policies which match prefix $($prefix) on target Prism Central $($targetPc)..." -ForegroundColor White
-        #endregion
+        Write-Host "$(get-date) [INFO] Retrieving Flow policy lists from $($sourcePc) and $($targetPc)..." -ForegroundColor Green
+        $policyLists = Get-PrismCatalogs -Catalogs @(
+            @{ Key = 'source'; Pc = $sourcePc; Object = 'policies' }
+            @{ Key = 'target'; Pc = $targetPc; Object = 'policies' }
+        )
+        $source_nsp_response = $policyLists.Catalogs['source']
+        $target_nsp_response = $policyLists.Catalogs['target']
+        Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of Flow policies from the source Prism Central instance $($sourcePc)" -ForegroundColor Cyan
+        $filtered_source_nsp_response = $source_nsp_response | Where-Object {$_.name -match "^$prefix"}
+        Write-Host "$(get-date) [DATA] There are $($filtered_source_nsp_response.count) Flow policies which match prefix $($prefix) on source Prism Central $($sourcePc)..." -ForegroundColor White
+        Write-Host "$(get-date) [SUCCESS] Successfully retrieved list of Flow policies from the target Prism Central instance $($targetPc)" -ForegroundColor Cyan
+        $filtered_target_nsp_response = $target_nsp_response | Where-Object {$_.name -match "^$prefix"}
+        Write-Host "$(get-date) [DATA] There are $($filtered_target_nsp_response.count) Flow policies which match prefix $($prefix) on target Prism Central $($targetPc)..." -ForegroundColor White
 
         if (!$filtered_source_nsp_response -and !$filtered_target_nsp_response)
         {#we didn't find any matching policies
@@ -1949,43 +3342,55 @@ Date       By              Updates (newest updates at the top)
 
         #* Policies to add ($add_nsp_list)
         #* Policies to update ($update_nsp_list)
+        $targetPolicyByName = @{}
+        foreach ($nsp in @($filtered_target_nsp_response))
+        {
+            if ($null -eq $nsp -or [string]::IsNullOrEmpty([string]$nsp.name)) { continue }
+            if (-not $targetPolicyByName.ContainsKey([string]$nsp.name))
+            {
+                $targetPolicyByName[[string]$nsp.name] = $nsp
+            }
+        }
+        $sourcePolicyNames = @{}
+        foreach ($nsp in @($filtered_source_nsp_response))
+        {
+            if ($null -eq $nsp -or [string]::IsNullOrEmpty([string]$nsp.name)) { continue }
+            $sourcePolicyNames[[string]$nsp.name] = $true
+        }
+
         [System.Collections.ArrayList]$add_nsp_list = New-Object System.Collections.ArrayList($null)
         [System.Collections.ArrayList]$update_nsp_list = New-Object System.Collections.ArrayList($null)
-        $compared_nsps = @()
-        foreach ($nsp in $filtered_source_nsp_response)
+        $seenSourcePolicies = @{}
+        foreach ($nsp in @($filtered_source_nsp_response))
         {#compare source with target
-            if ($nsp.name -notin $compared_nsps)
-            {#we haven't processed that policy yet
-                if ($nsp.name -notin $filtered_target_nsp_response.name)
-                {#policy exists on source but not on target -- CREATE scenario
-                    Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) does not exist yet on target Prism Central $($targetPc)" -ForegroundColor Green
-                    $add_nsp_list.Add($nsp) | Out-Null
-                }
-                else
-                {#policy exists on source and on target -- UPDATE scenario
-                    Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) exists on target Prism Central $($targetPc)" -ForegroundColor Green
-                    $update_nsp_list.Add($nsp) | Out-Null
-                }
-                $compared_nsps += $nsp.name
+            if ($null -eq $nsp -or $seenSourcePolicies.ContainsKey([string]$nsp.name)) { continue }
+            $seenSourcePolicies[[string]$nsp.name] = $true
+            if ($targetPolicyByName.ContainsKey([string]$nsp.name))
+            {#policy exists on source and on target -- UPDATE scenario
+                Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) exists on target Prism Central $($targetPc)" -ForegroundColor Green
+                [void]$update_nsp_list.Add($nsp)
+            }
+            else
+            {#policy exists on source but not on target -- CREATE scenario
+                Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) does not exist yet on target Prism Central $($targetPc)" -ForegroundColor Green
+                [void]$add_nsp_list.Add($nsp)
             }
         }
         Write-Host "$(get-date) [DATA] There are $($add_nsp_list.count) Flow policies to be created on target Prism Central $($targetPc)" -ForegroundColor White
 
-        Write-Host "$(get-date) [DATA] There are $($update_nsp_list.count) Flow policies to update on target Prism Central $($targetPc)" -ForegroundColor White
+        Write-Host "$(get-date) [DATA] There are $($update_nsp_list.count) Flow policies already on target Prism Central $($targetPc)" -ForegroundColor White
 
         #* Policies to remove ($remove_nsp_list)
         [System.Collections.ArrayList]$remove_nsp_list = New-Object System.Collections.ArrayList($null)
-        $compared_nsps = @()
-        foreach ($nsp in $filtered_target_nsp_response)
+        $seenTargetPolicies = @{}
+        foreach ($nsp in @($filtered_target_nsp_response))
         {#compare target with source
-            if ($nsp.name -notin $compared_nsps)
-            {#we haven't processed that policy yet
-                if ($nsp.name -notin $filtered_source_nsp_response.name)
-                {#Policy exists on target but not on source
-                    Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) no longer exists on source Prism Central $($sourcePc)" -ForegroundColor Green
-                    $remove_nsp_list.Add($nsp) | Out-Null
-                }
-                $compared_nsps += $nsp.name
+            if ($null -eq $nsp -or $seenTargetPolicies.ContainsKey([string]$nsp.name)) { continue }
+            $seenTargetPolicies[[string]$nsp.name] = $true
+            if (-not $sourcePolicyNames.ContainsKey([string]$nsp.name))
+            {#Policy exists on target but not on source
+                Write-Host "$(get-date) [INFO] Flow policy $($nsp.name) no longer exists on source Prism Central $($sourcePc)" -ForegroundColor Green
+                [void]$remove_nsp_list.Add($nsp)
             }
         }
         Write-Host "$(get-date) [DATA] There are $($remove_nsp_list.count) Flow policies to remove on target Prism Central $($targetPc)" -ForegroundColor White
@@ -1999,82 +3404,51 @@ Date       By              Updates (newest updates at the top)
             if($rename)
             {
                 #region delete policies
-                    #get all policies
-                    $target_nsp_response = Get-MicrosegObjectList -pc $targetPc -object "policies"
-                    $filtered_target_nsp_response = $target_nsp_response | Where-Object {$_.name -match "^$rename"}
+                    #reuse the target policy list already retrieved above
+                    $filtered_target_nsp_response = $target_nsp_response | Where-Object { $_ -and $_.name -match "^$rename" }
+                    $policyDeletes = New-Object System.Collections.Generic.List[object]
                     foreach ($nsp in $filtered_target_nsp_response)
                     {
-                        #delete policy on target
-                        $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                        $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$nsp.extId
-                        $method = "DELETE"
-                        $ntnx_req_id = New-Guid
-
-                        Write-Host "$(get-date) [STEP] Deleting renamed policy $($nsp.name) on $($targetPc)" -ForegroundColor Green
-                        try
-                        {#delete the policy
-                            $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -ntnx_req_id $ntnx_req_id
-                            Write-Host "$(Get-Date) [SUCCESS] Deleted renamed policy $($nsp.name) from $targetPc" -ForegroundColor Cyan
-
-                        }
-                        catch
-                        {#we couldn't delete the policy
-                            Throw "$($_.Exception.Message)"
-                        }
+                        $policyDeletes.Add([pscustomobject]@{
+                            Name = $nsp.name
+                            Label = "renamed policy $($nsp.name)"
+                            Url = ("https://{0}:9440/api/microseg/v4.0/config/policies/{1}" -f $targetPc, $nsp.extId)
+                        })
                     }
+                    Invoke-PrismDeleteSet -Entries $policyDeletes | Out-Null
                 #endregion
 
                 #region delete address groups
-                    #get all address groups
                     $target_address_groups = Get-MicrosegObjectList -pc $targetPc -object "address-groups"
                     $filtered_target_address_groups = $target_address_groups | Where-Object {$_.name -match "^$rename"}
-                    foreach ($ag in $filtered_target_address_groups)
+                    $addressDeletes = New-Object System.Collections.Generic.List[object]
+                    foreach ($ag in @($filtered_target_address_groups))
                     {
-                        #delete ag on target
-                        $api_server_endpoint = "/api/microseg/v4.0/config/address-groups"
-                        $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$ag.extId
-                        $method = "DELETE"
-                        $ntnx_req_id = New-Guid
-
-                        Write-Host "$(get-date) [STEP] Deleting renamed address group $($ag.name) on $($targetPc)" -ForegroundColor Green
-                        try
-                        {#delete the ag
-                            $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -ntnx_req_id $ntnx_req_id
-                            Write-Host "$(Get-Date) [SUCCESS] Deleted renamed address group $($ag.name) to $targetPc" -ForegroundColor Cyan
-
-                        }
-                        catch
-                        {#we couldn't delete the ag
-                            Throw "$($_.Exception.Message)"
-                        }
+                        if (-not $ag) { continue }
+                        $addressDeletes.Add([pscustomobject]@{
+                            Name = $ag.name
+                            Label = "renamed address group $($ag.name)"
+                            Url = ("https://{0}:9440/api/microseg/v4.0/config/address-groups/{1}" -f $targetPc, $ag.extId)
+                        })
                     }
+                    Invoke-PrismDeleteSet -Entries $addressDeletes | Out-Null
                 #endregion
 
                 #region delete service groups
-                    #get all service groups
-                    $filter = "`$filter=isSystemDefined eq false"
-                    $target_service_groups = Get-MicrosegObjectList -pc $targetPc -object "service-groups?$filter"
+                    $serviceGroupFilter = ConvertTo-ODataFilterQuery -Expression "isSystemDefined eq false"
+                    $target_service_groups = Get-MicrosegObjectList -pc $targetPc -object ("service-groups?" + $serviceGroupFilter)
                     $filtered_target_service_groups = $target_service_groups | Where-Object {$_.name -match "^$rename"}
-                    foreach ($sg in $filtered_target_service_groups)
+                    $serviceDeletes = New-Object System.Collections.Generic.List[object]
+                    foreach ($sg in @($filtered_target_service_groups))
                     {
-                        #delete sg on target
-                        $api_server_endpoint = "/api/microseg/v4.0/config/service-groups"
-                        $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$sg.extId
-                        $method = "DELETE"
-                        $ntnx_req_id = New-Guid
-
-                        Write-Host "$(get-date) [STEP] Deleting renamed service group $($sg.name) on $($targetPc)" -ForegroundColor Green
-                        try
-                        {#delete the sg
-                            $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -ntnx_req_id $ntnx_req_id
-                            Write-Host "$(Get-Date) [SUCCESS] Deleted renamed service group $($sg.name) to $targetPc" -ForegroundColor Cyan
-
-                        }
-                        catch
-                        {#we couldn't delete the sg
-                            Throw "$($_.Exception.Message)"
-                        }
+                        if (-not $sg) { continue }
+                        $serviceDeletes.Add([pscustomobject]@{
+                            Name = $sg.name
+                            Label = "renamed service group $($sg.name)"
+                            Url = ("https://{0}:9440/api/microseg/v4.0/config/service-groups/{1}" -f $targetPc, $sg.extId)
+                        })
                     }
+                    Invoke-PrismDeleteSet -Entries $serviceDeletes | Out-Null
                 #endregion
 
             }
@@ -2086,216 +3460,341 @@ Date       By              Updates (newest updates at the top)
 
         if ($action -eq "sync")
         {#synchronize (ADD, DELETE, UPDATE)
+            $script:ExtIdMap = @{}
+            $script:SourceObjectCache = @{}
+            $script:MissingSourceExtIds = @{}
+            $script:PendingCategoryIds = @{}
+            $script:PendingAddressGroups = @{}
+            $script:PendingServiceGroups = @{}
+            $script:PendingRenames = @{}
+            $script:AwaitingCreateExtId = @{}
+            $script:PostedCreates = @{}
+            $script:UnresolvedCreates = @{}
+            $script:SourceCategoryIndex = @{}
+            $targetAgByName = @{}
+            $targetSgByName = @{}
+            $targetCategoryIndex = @{}
+            $targetVpcByName = @{}
+            $script:TargetCategoryIndex = $targetCategoryIndex
+            $script:TargetAddressGroupByName = $targetAgByName
+            $script:TargetServiceGroupByName = $targetSgByName
+
+            $addWork = New-Object System.Collections.Generic.List[object]
+            $updateWork = New-Object System.Collections.Generic.List[object]
+            $workQueue = New-Object System.Collections.Generic.List[object]
+            foreach ($nsp in @($add_nsp_list)) { if ($nsp) { $workQueue.Add([pscustomobject]@{ Nsp = $nsp; Action = 'add' }) } }
+            foreach ($nsp in @($update_nsp_list)) { if ($nsp) { $workQueue.Add([pscustomobject]@{ Nsp = $nsp; Action = 'update' }) } }
+
+            $policyByExtId = @{}
+            if ($workQueue.Count -gt 0)
+            {
+                Write-Host ""
+                Write-Host "$(get-date) [STEP] Getting source and target Flow catalogs" -ForegroundColor Magenta
+                $fetched = Get-PrismCatalogs -Catalogs @(
+                    @{ Key = 'source address groups'; Pc = $sourcePc; Object = 'address-groups' }
+                    @{ Key = 'source service groups'; Pc = $sourcePc; Object = 'service-groups' }
+                    @{ Key = 'source categories'; Pc = $sourcePc; ApiPath = 'api/prism/v4.0.a2/config/categories' }
+                    @{ Key = 'source vpcs'; Pc = $sourcePc; ApiPath = 'api/networking/v4.0/config/vpcs' }
+                    @{ Key = 'address groups'; Pc = $targetPc; Object = 'address-groups' }
+                    @{ Key = 'service groups'; Pc = $targetPc; Object = 'service-groups' }
+                    @{ Key = 'cat'; Pc = $targetPc; ApiPath = 'api/prism/v4.0.a2/config/categories' }
+                    @{ Key = 'vpc'; Pc = $targetPc; ApiPath = 'api/networking/v4.0/config/vpcs' }
+                )
+                Import-ListedSourceObjects $fetched.Catalogs['source address groups']
+                Import-ListedSourceObjects $fetched.Catalogs['source service groups']
+                Import-ListedSourceObjects $fetched.Catalogs['source categories']
+                Import-ListedSourceObjects $fetched.Catalogs['source vpcs']
+
+                $targetAgByName = New-NameIndex $fetched.Catalogs['address groups']
+                $targetSgByName = New-NameIndex $fetched.Catalogs['service groups']
+                $targetCategoryIndex = New-CategoryIndex $fetched.Catalogs['cat']
+                $targetVpcByName = New-NameIndex $fetched.Catalogs['vpc']
+                $script:TargetCategoryIndex = $targetCategoryIndex
+                $script:TargetAddressGroupByName = $targetAgByName
+                $script:TargetServiceGroupByName = $targetSgByName
+                $script:TargetVpcByName = $targetVpcByName
+                $script:TargetObjectByExtId = @{}
+                foreach ($catalogName in @('address groups', 'service groups', 'cat', 'vpc'))
+                {
+                    foreach ($catalogItem in (Get-EnumeratedItems $fetched.Catalogs[$catalogName]))
+                    {
+                        if ($catalogItem -and $catalogItem.extId) { $script:TargetObjectByExtId[[string]$catalogItem.extId] = $catalogItem }
+                    }
+                }
+
+                $sourceCategoryCount = 0
+                foreach ($categoryKey in @($script:SourceCategoryIndex.Keys)) { $sourceCategoryCount += $script:SourceCategoryIndex[$categoryKey].Count }
+                $categoryCount = 0
+                foreach ($categoryKey in @($targetCategoryIndex.Keys)) { $categoryCount += $targetCategoryIndex[$categoryKey].Count }
+                Write-Host "$(get-date) [DATA] There are $($fetched.Catalogs['source address groups'].Count) address groups, $($fetched.Catalogs['source service groups'].Count) service groups, $sourceCategoryCount categories, and $($fetched.Catalogs['source vpcs'].Count) VPCs on $sourcePc" -ForegroundColor White
+                Write-Host "$(get-date) [DATA] There are $($targetAgByName.Count) address groups, $($targetSgByName.Count) service groups, $categoryCount categories, and $($targetVpcByName.Count) VPCs on $targetPc" -ForegroundColor White
+
+                $queue = $workQueue.ToArray()
+                $chunkSize = 200
+                for ($offset = 0; $offset -lt $queue.Length; $offset += $chunkSize)
+                {
+                    $count = [Math]::Min($chunkSize, $queue.Length - $offset)
+                    Write-Host "$(get-date) [STEP] Reading policy definitions $($offset + 1)-$($offset + $count) of $($queue.Length)" -ForegroundColor Magenta
+                    $batch = New-Object System.Collections.Generic.List[object]
+                    $chunkItems = New-Object System.Collections.Generic.List[object]
+                    $policyNames = @{}
+                    for ($i = 0; $i -lt $count; $i++)
+                    {
+                        $item = $queue[$offset + $i]
+                        $chunkItems.Add($item)
+                        $policyNames[[string]$item.Nsp.extId] = [string]$item.Nsp.name
+                        $batch.Add([pscustomobject]@{
+                            Id = "policy|$($item.Nsp.extId)"
+                            Method = 'GET'
+                            Url = "https://$sourcePc`:9440/api/microseg/v4.0/config/policies/$($item.Nsp.extId)"
+                        })
+                    }
+                    $script:CreateProgressDone = 0
+                    $script:CreateProgressTotal = 0
+                    foreach ($create in (Get-EnumeratedItems (Get-PendingCreateRequests)))
+                    {
+                        $batch.Add($create)
+                        $script:CreateProgressTotal++
+                    }
+                    $script:ReadProgressDone = 0
+                    $readTotal = $queue.Length
+                    $chunkReadStart = $offset
+                    $chunkReadCount = $count
+                    $policyFailure = $null
+                    foreach ($result in @(Invoke-PrismRequestBatch -Requests $batch -BatchErrorAction Continue -OnResult {
+                        param($Result)
+                        if ([string]$Result.Id -like 'policy|*')
+                        {
+                            $script:ReadProgressDone++
+                            $position = $chunkReadStart + $script:ReadProgressDone
+                            if ($script:ReadProgressDone -eq 1 -or ($script:ReadProgressDone % 20) -eq 0 -or $script:ReadProgressDone -eq $chunkReadCount)
+                            {
+                                Write-Host "$(Get-Date) [INFO] Read $position of $readTotal policy definitions" -ForegroundColor Green
+                            }
+                            return
+                        }
+                        Register-CreateResult -Result $Result
+                    }))
+                    {
+                        if ([string]$result.Id -like 'policy|*')
+                        {
+                            $extId = ($result.Id -split '\|', 2)[1]
+                            if ($result.Ok -and $result.Body)
+                            {
+                                $policyByExtId[$extId] = $result.Body
+                            }
+                            elseif ($result.Ok)
+                            {
+                                Write-Host "$(get-date) [WARNING] Policy $($policyNames[$extId]) returned no body from $sourcePc and will not be synced" -ForegroundColor Yellow
+                            }
+                            elseif ([string]$result.Error -match '404')
+                            {
+                                Write-Host "$(get-date) [WARNING] The policy extId specified ($extId) does not exist in Prism Central $sourcePc" -ForegroundColor Yellow
+                            }
+                            elseif (-not $policyFailure)
+                            {
+                                $reason = if ($result.Error) { $result.Error } else { "missing policy response" }
+                                $policyName = $policyNames[$extId]
+                                if (-not $policyName) { $policyName = $extId }
+                                $policyFailure = "$(Get-Date) [ERROR] Failed to read policy ${policyName}: $reason"
+                            }
+                        }
+                    }
+                    if ($policyFailure) { Throw $policyFailure }
+                    $chunkWork = New-Object System.Collections.Generic.List[object]
+                    foreach ($item in (Get-EnumeratedItems $chunkItems))
+                    {
+                        $work = Add-SyncedPolicyWork -Nsp $item.Nsp -Action $item.Action -PolicyByExtId $policyByExtId -AddWork $addWork -UpdateWork $updateWork
+                        if ($work) { $chunkWork.Add($work) }
+                    }
+                    if ($chunkWork.Count -gt 0)
+                    {
+                        $referencedPolicies = New-Object System.Collections.Generic.List[object]
+                        foreach ($work in (Get-EnumeratedItems $chunkWork)) { $referencedPolicies.Add($work.Policy) }
+                        Import-ReferencedSourceObjects -Policies $referencedPolicies
+                        Sync-PolicyReferences -WorkItems $chunkWork -Phase Map -TargetVpcByName $targetVpcByName -TargetCategoryIndex $targetCategoryIndex -TargetSgByName $targetSgByName -TargetAgByName $targetAgByName
+                    }
+                }
+
+                Invoke-PendingCreates
+                Resolve-UnmappedCreates
+                Complete-PendingRenames
+                foreach ($work in (Get-EnumeratedItems $updateWork))
+                {
+                    if (-not $work -or -not $work.Policy) { continue }
+                    $sourceCopy = ConvertFrom-Json (ConvertTo-Json $work.Policy -Depth 100)
+                    $work | Add-Member -NotePropertyName SourcePolicy -NotePropertyValue $sourceCopy -Force
+                }
+                $syncWork = New-Object System.Collections.Generic.List[object]
+                foreach ($work in (Get-EnumeratedItems $addWork)) { $syncWork.Add($work) }
+                foreach ($work in (Get-EnumeratedItems $updateWork)) { $syncWork.Add($work) }
+                Sync-PolicyReferences -WorkItems $syncWork -Phase Rewrite -TargetVpcByName $targetVpcByName -TargetCategoryIndex $targetCategoryIndex -TargetSgByName $targetSgByName -TargetAgByName $targetAgByName
+            }
 
             #region process ADD
-                if ($add_nsp_list)
-                {#there are policies to be added
+                if ($addWork.Count -gt 0)
+                {
                     Write-Host ""
                     Write-Host "$(get-date) [STEP] Adding Flow policies" -ForegroundColor Magenta
-                    foreach ($nsp in $add_nsp_list)
-                    {#process each nsp to add
-
-                        #get the complete nsp from source
-                        $policy = Get-PolicyByExtId -pc $sourcePc -extId $nsp.extId
-
-                        if ($policy.data.scope -eq "ALL_VLAN")
+                    $addRequests = New-Object System.Collections.Generic.List[object]
+                    $addNames = @{}
+                    foreach ($work in $addWork)
+                    {
+                        $policyname = $work.Policy.data.name
+                        if ($rename) { $policyname = $rename + "_" + $work.Policy.data.name }
+                        $addNames[[string]$work.Nsp.name] = [string]$policyname
+                        $addRequests.Add([pscustomobject]@{
+                            Id = [string]$work.Nsp.name
+                            Method = 'POST'
+                            Url = "https://$targetPc`:9440/api/microseg/v4.0/config/policies"
+                            Payload = (ConvertTo-Json (New-SyncedPolicyContent -Policy $work.Policy -PolicyName $policyname -OmitGeneratedOutboundRules) -Depth 100)
+                            NtnxReqId = [string](New-Guid)
+                        })
+                    }
+                    $script:PolicyAddDone = 0
+                    $policyAddTotal = $addRequests.Count
+                    foreach ($result in @(Invoke-PrismRequestBatch -Requests $addRequests -BatchErrorAction Continue -OnResult {
+                        param($Result)
+                        $displayName = $addNames[[string]$Result.Id]
+                        if (-not $displayName) { $displayName = [string]$Result.Id }
+                        if ($Result.Ok)
                         {
-                            Write-Host "$(Get-Date) [WARNING] Not Syncing policy $($policy.data.name) as it is a VLAN policy" -ForegroundColor Cyan
-                            continue
-                        } 
-                        elseif ($policy.data.scope -ne "GLOBAL") 
-                        {
-                            Sync-Vpc -policy $policy
+                            $script:PolicyAddDone++
+                            $added = $displayName
+                            if ($displayName -ne [string]$Result.Id) { $added = "$($Result.Id) as $displayName" }
+                            Write-Host "$(Get-Date) [SUCCESS] Added Flow policy $added to $targetPc ($($script:PolicyAddDone) of $policyAddTotal)" -ForegroundColor Cyan
                         }
-                        Sync-Categories -policy $policy
-                        Sync-ServiceGroups -policy $policy
-                        Sync-AddressGroups -policy $policy
-
-
-                        #region add nsp on target
-                            $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                            $url = "https://{0}:9440{1}" -f $targetPc,$api_server_endpoint
-                            $method = "POST"
-                            $policyname = $policy.data.name
-                            if($rename)
-                            {
-                                $policyname = $rename + "_" + $policy.data.name
-                                Write-Host "$(Get-Date) [INFO] Adding Flow policy $($nsp.name) to $targetPc with new name $policyname" -ForegroundColor Cyan
-                            }
-                            if ($policy.data.scope -ne "GLOBAL") {
-                                $content = @{
-                                    name= $policyname;
-                                    type= $policy.data.type;
-                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                    state= $policy.data.state;
-                                    rules= $policy.data.rules;
-                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                    vpcReferences= $policy.data.vpcReferences
-                                }
-                            } 
-                            else 
-                            {
-                                $content = @{
-                                    name= $policyname;
-                                    type= $policy.data.type;
-                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                    state= $policy.data.state;
-                                    rules= $policy.data.rules;
-                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                    scope= $policy.data.scope
-                                }
-                            }
-                            $payload = (ConvertTo-Json $content -Depth 100)
-                            $ntnx_req_id = New-Guid
-                            try
-                            {#create network policy
-                                $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id
-                                Write-Host "$(Get-Date) [SUCCESS] Added Flow policy $($nsp.name) to $targetPc" -ForegroundColor Cyan
-                                if ($debugme) {$resp}
-                                #Get-PrismCentralTaskStatus -task $resp -credential $prismCredentials -cluster $targetPc
-                            }
-                            catch
-                            {#we couldn't create the network policy
-                                if ($_.Exception.Message -match 'Policy already exists')
-                                {#the policy already exists, let's just warn about this
-                                    Write-Host "$(Get-Date) [WARNING] Could not add policy $($nsp.name) to $targetPc" -ForegroundColor Yellow
-                                    Write-Host "$($_.Exception.Message)" -ForegroundColor Yellow
-                                }
-                                else
-                                {
-                                    Throw "$($_.Exception.Message)"
-                                }
-                            }
-                        #endregion
-
-                        Write-Host ""
+                        elseif ($Result.Error -match 'Policy already exists')
+                        {
+                            Write-Host "$(Get-Date) [WARNING] Could not add policy $displayName to $targetPc" -ForegroundColor Yellow
+                            Write-Host $Result.Error -ForegroundColor Yellow
+                        }
+                    }))
+                    {
+                        if ($result -and $result.Ok)
+                        {
+                            if ($debugme) { $result.Body }
+                        }
+                        elseif ($result -and $result.Error -match 'Policy already exists')
+                        {
+                            continue
+                        }
+                        else
+                        {
+                            $reason = if ($result) { $result.Error } else { "missing create response" }
+                            Throw "$reason"
+                        }
                     }
                 }
             #endregion
-
 
             #region process DELETE
-                if ($remove_nsp_list)
-                {#there are the policies to be removed
+                if ($remove_nsp_list.Count -gt 0)
+                {
                     Write-Host ""
                     Write-Host "$(get-date) [STEP] Removing Flow policies" -ForegroundColor Magenta
-                    foreach ($nsp in $remove_nsp_list)
-                    {#process each policy to remove
-                        #todo: for each category, figure out if it is used anywhere else in policies on source: if not, delete the category
-                        #get policy on target using name to get ext id
-                            $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                            $filter = "`$filter=name eq '$($nsp.name)'"
-                            $url = "https://{0}:9440{1}?{2}" -f $targetPc,$api_server_endpoint,$filter
-                            $method = "GET"
-                            $policy = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                        #delete policy on target
-                            $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                            $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$policy.data.extId
-                            $method = "DELETE"
-                            $ntnx_req_id = New-Guid
-
-                        Write-Host "$(get-date) [STEP] Deleting Flow policy $($nsp.name) on $($targetPc)" -ForegroundColor Green
-                        try
-                        {#delete the policy
-                            $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -ntnx_req_id $ntnx_req_id
-                            Write-Host "$(Get-Date) [SUCCESS] Deleted Flow policy $($nsp.name) to $targetPc" -ForegroundColor Cyan
-
-                        }
-                        catch
-                        {#we couldn't delete the policy
-                            Throw "$($_.Exception.Message)"
-                        }
+                    $policyDeletes = New-Object System.Collections.Generic.List[object]
+                    foreach ($nsp in @($remove_nsp_list))
+                    {
+                        if (-not $nsp) { continue }
+                        $policyDeletes.Add([pscustomobject]@{
+                            Name = $nsp.name
+                            Label = "Flow policy $($nsp.name)"
+                            Url = ("https://{0}:9440/api/microseg/v4.0/config/policies/{1}" -f $targetPc, $nsp.extId)
+                        })
                     }
+                    Invoke-PrismDeleteSet -Entries $policyDeletes | Out-Null
                 }
             #endregion
 
-
             #region process UPDATE
-                if ($update_nsp_list)
-                {#there are policies to be updated
+                if ($updateWork.Count -gt 0)
+                {
                     Write-Host ""
                     Write-Host "$(get-date) [STEP] Updating Flow policies" -ForegroundColor Magenta
-                    foreach ($nsp in $update_nsp_list)
-                    {#process each nsp to update
-
-                        #get the complete nsp from source
-                        $policy = Get-PolicyByExtId -pc $sourcePc -extId $nsp.extId
-
-                        if ($policy.data.scope -eq "ALL_VLAN")
+                    $etagRequests = New-Object System.Collections.Generic.List[object]
+                    $updateById = @{}
+                    foreach ($work in $updateWork)
+                    {
+                        $targetNsp = $targetPolicyByName[[string]$work.Nsp.name]
+                        if (-not $targetNsp)
                         {
-                            Write-Host "$(Get-Date) [WARNING] Not Syncing policy $($policy.data.name) as it is a VLAN policy" -ForegroundColor Cyan
-                            continue
-                        } elseif ($policy.data.scope -ne "GLOBAL") 
-                        {
-                            Sync-Vpc -policy $policy
+                            Throw "$(Get-Date) [ERROR] Flow policy $($work.Nsp.name) was not found on target Prism Central $targetPc"
                         }
-                        Sync-Categories -policy $policy
-                        Sync-ServiceGroups -policy $policy
-                        Sync-AddressGroups -policy $policy
-
-                        #get policy on target using name to get ext id
-                            $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                            $filter = "`$filter=name eq '$($nsp.name)'"
-                            $method = "GET"
-                            $url = "https://{0}:9440{1}?{2}" -f $targetPc,$api_server_endpoint,$filter
-                            $targetPolicy = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials
-
-                            $auth = @{ Authorization = "Basic "+ [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$($prismCredentials.UserName):$($prismCredentials.GetNetworkCredential().password)")) }
-                            $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$targetPolicy.data.extId
-                            $targetPolicyEtag = Invoke-WebRequest -Uri $url -SkipCertificateCheck -Headers $auth
-
-                        #region add nsp on target
-                            $api_server_endpoint = "/api/microseg/v4.0/config/policies"
-                            $url = "https://{0}:9440{1}/{2}" -f $targetPc,$api_server_endpoint,$targetPolicy.data.extId
-                            $method = "PUT"
-                            $policyname = $policy.data.name
-                            if($rename)
-                            {
-                                $policyname = $rename + "_" + $policy.data.name
-                                Write-Host "$(Get-Date) [INFO] Updating Flow policy $($nsp.name) to $targetPc with new name $policyname" -ForegroundColor Cyan
-                            }
-                            if ($policy.data.scope -ne "GLOBAL") 
-                            {
-                                $content = @{
-                                    name= $policyname;
-                                    type= $policy.data.type;
-                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                    state= $policy.data.state;
-                                    rules= $policy.data.rules;
-                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                    vpcReferences= $policy.data.vpcReferences
-                                }
-                            }
-                            else 
-                            {
-                                $content = @{
-                                    name= $policyname;
-                                    type= $policy.data.type;
-                                    description= "added by Invoke-FlowRuleSyncNG.ps1 script";
-                                    state= $policy.data.state;
-                                    rules= $policy.data.rules;
-                                    isIpv6TrafficAllowed= $policy.data.isIpv6TrafficAllowed;
-                                    isHitlogEnabled= $policy.data.isHitlogEnabled;
-                                    scope= $policy.data.scope
-                                }
-                            }
-                            $payload = (ConvertTo-Json $content -Depth 100)
-                            $ntnx_req_id = New-Guid
-                            $if_match = [System.String]($targetPolicyEtag.Headers.ETag)
-                            try
-                            {#update the network policy
-                                $resp = Invoke-RateLimitedApiCall -method $method -url $url -credential $prismCredentials -payload $payload -ntnx_req_id $ntnx_req_id -if_match $if_match
-                                Write-Host "$(Get-Date) [SUCCESS] Updated Flow policy $($nsp.name) to $targetPc" -ForegroundColor Cyan
-                            }
-                            catch
-                            {#we couldn't update the network policy
-                                Throw "$($_.Exception.Message)"
-                            }
-                        #endregion
+                        $policyname = $work.Policy.data.name
+                        if ($rename) { $policyname = $rename + "_" + $work.Policy.data.name }
+                        $url = "https://{0}:9440/api/microseg/v4.0/config/policies/{1}" -f $targetPc, $targetNsp.extId
+                        $updateById[[string]$targetNsp.extId] = [pscustomobject]@{ Work = $work; PolicyName = $policyname; Url = $url }
+                        $etagRequests.Add([pscustomobject]@{ Id = [string]$targetNsp.extId; Method = 'GET'; Url = $url; ReturnBodyAndETag = $true })
+                    }
+                    $putRequests = New-Object System.Collections.Generic.List[object]
+                    $script:UpdateUnchanged = 0
+                    $script:UpdateReadDone = 0
+                    $updateReadTotal = $etagRequests.Count
+                    Invoke-PrismRequestBatch -Requests $etagRequests -OnResult {
+                        param($Result)
+                        if (-not $Result.Ok) { Throw "$(Get-Date) [ERROR] Failed to read policy $($Result.Id): $($Result.Error)" }
+                        $update = $updateById[$Result.Id]
+                        $targetData = $Result.Body.Body.data
+                        if (-not $targetData) { Throw "$(Get-Date) [ERROR] Policy $($update.Work.Nsp.name) returned no body from $targetPc" }
+                        $script:UpdateReadDone++
+                        $progress = "$($script:UpdateReadDone) of $updateReadTotal"
+                        $desired = New-SyncedPolicyContent -Policy $update.Work.Policy -PolicyName $update.PolicyName
+                        if (-not $update.Work.SourcePolicy -or -not $update.Work.SourcePolicy.data)
+                        {
+                            Throw "$(Get-Date) [ERROR] Flow policy $($update.Work.Nsp.name) has no source body to compare"
+                        }
+                        $differencePaths = Get-PolicyDifferencePaths -Source $update.Work.SourcePolicy.data -Target $targetData
+                        if ($differencePaths.Count -eq 0)
+                        {
+                            $script:UpdateUnchanged++
+                            Write-Host "$(Get-Date) [INFO] Flow policy $($update.Work.Nsp.name) is unchanged on $targetPc ($progress)" -ForegroundColor Green
+                            return
+                        }
+                        $shown = 0
+                        foreach ($path in $differencePaths)
+                        {
+                            if ($shown -ge 12) { break }
+                            Write-Host "$(Get-Date) [DATA] Flow policy $($update.Work.Nsp.name) differs in $path" -ForegroundColor White
+                            $shown++
+                        }
+                        $remaining = $differencePaths.Count - $shown
+                        if ($remaining -gt 0)
+                        {
+                            Write-Host "$(Get-Date) [DATA] Flow policy $($update.Work.Nsp.name) differs in $remaining more elements" -ForegroundColor White
+                        }
+                        if ($rename)
+                        {
+                            Write-Host "$(Get-Date) [INFO] Updating Flow policy $($update.Work.Nsp.name) to $targetPc with new name $($update.PolicyName) ($progress)" -ForegroundColor Cyan
+                        }
+                        else
+                        {
+                            Write-Host "$(Get-Date) [INFO] Flow policy $($update.Work.Nsp.name) will be updated on $targetPc ($progress)" -ForegroundColor Cyan
+                        }
+                        $putRequests.Add([pscustomobject]@{
+                            Id = [string]$update.Work.Nsp.name
+                            Method = 'PUT'
+                            Url = $update.Url
+                            Payload = (ConvertTo-Json $desired -Depth 100)
+                            NtnxReqId = [string](New-Guid)
+                            IfMatch = [string]$Result.Body.ETag
+                        })
+                    } | Out-Null
+                    Write-Host "$(get-date) [DATA] $($script:UpdateUnchanged) Flow policies are unchanged on $targetPc" -ForegroundColor White
+                    Write-Host "$(get-date) [DATA] $($putRequests.Count) Flow policies to update on $targetPc" -ForegroundColor White
+                    if ($putRequests.Count -gt 0)
+                    {
+                        $script:PolicyUpdateDone = 0
+                        $policyUpdateTotal = $putRequests.Count
+                        foreach ($result in @(Invoke-PrismRequestBatch -Requests $putRequests -OnResult {
+                            param($Result)
+                            if (-not $Result.Ok) { return }
+                            $script:PolicyUpdateDone++
+                            Write-Host "$(Get-Date) [SUCCESS] Updated Flow policy $($Result.Id) to $targetPc ($($script:PolicyUpdateDone) of $policyUpdateTotal)" -ForegroundColor Cyan
+                        }))
+                        {
+                            if (-not $result.Ok) { Throw "$(Get-Date) [ERROR] Failed to update Flow policy $($result.Id): $($result.Error)" }
+                        }
                     }
                 }
             #endregion
@@ -2306,6 +3805,7 @@ Date       By              Updates (newest updates at the top)
 
 
 #region cleanup
+    Close-PrismRunspacePool
     #let's figure out how much time this all took
     Write-Host ""
     Write-Host "$(get-date) [SUM] total processing time: $($myvarElapsedTime.Elapsed.ToString())" -ForegroundColor Magenta
