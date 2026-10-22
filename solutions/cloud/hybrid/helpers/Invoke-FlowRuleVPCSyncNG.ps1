@@ -916,6 +916,7 @@ public class PrismGateStore {
 
     #One HTTP call on the current thread, using the shared gate.
     #A rate-limited call is retried. Three such responses lower that Prism Central to 2.
+    #A 504 upstream timeout is retried the same number of times and does not change MaxInFlight.
     function Invoke-RateLimitedApiCall
     {
         [CmdletBinding()]
@@ -950,7 +951,9 @@ public class PrismGateStore {
             }
             catch
             {
-                $rateLimited = Test-PrismRateLimited -Message ([string]$_.Exception.Message)
+                $detail = [string]$_.Exception.Message
+                $rateLimited = Test-PrismRateLimited -Message $detail
+                $upstreamTimeout = $detail -match '(?i)(\[ERROR\]\s*504\b|upstream request timeout)'
                 if ($rateLimited)
                 {
                     $previous = [PrismGateStore]::RecordRateLimit($pc)
@@ -960,7 +963,11 @@ public class PrismGateStore {
                         Write-Host "$(Get-Date) [WARNING] MaxInFlight for $pc changed from $previous to $currentLimit after repeated Prism rate-limit responses." -ForegroundColor Yellow
                     }
                 }
-                if (-not $rateLimited -or $attempt -ge $maxAttempts) { throw }
+                if ((-not $rateLimited -and -not $upstreamTimeout) -or $attempt -ge $maxAttempts) { throw }
+                if ($upstreamTimeout)
+                {
+                    Write-Host "$(Get-Date) [WARNING] [$method $pc] 504 upstream request timeout. Retrying attempt $($attempt + 1) of $maxAttempts." -ForegroundColor Yellow
+                }
             }
             finally
             {
@@ -3252,6 +3259,7 @@ Date       By              Updates (newest updates at the top)
 10/22/2026 nx-sbourdeaud  Leave Outbound default rule out of a new policy so Prism can create it.
 10/22/2026 nx-sbourdeaud  Keep a custom Outbound default rule and omit only the Allow All, All Traffic rule.
 10/22/2026 nx-sbourdeaud  Report each delete as INFO so STEP stays reserved for section headers.
+10/22/2026 nx-sbourdeaud  Retry a Prism 504 upstream timeout without lowering MaxInFlight.
 
 ################################################################################
 '@
